@@ -19,7 +19,7 @@
 # Version: 1.1.0
 
 # Default values
-DEFAULT_CLUSTER_NAME="uds-eks-test-uds"
+DEFAULT_CLUSTER_NAME="uds-eks-dev-uds"
 DEFAULT_REGION="us-gov-east-1"
 DEFAULT_FILTER_VALUE="*bastion*"
 DEFAULT_PROFILE="jam-dev"
