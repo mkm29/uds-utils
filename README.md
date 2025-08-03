@@ -104,7 +104,7 @@ A vulnerability scanning tool that uses Grype to scan container images from UDS 
 
 #### Prerequisites
 
-The script requires registry credentials. You can either set environment variables or the script will prompt you:
+The script requires registry credentials for both UDS and Iron Bank registries. You can either set environment variables or the script will prompt you:
 
 ```bash
 # Option 1: Set environment variables
@@ -113,23 +113,60 @@ export UDS_PASSWORD="your-password"
 export UDS_URL="registry.defenseunicorns.com"
 export ORGANIZATION="sld-45"  # Optional, defaults to sld-45
 
+# Iron Bank credentials (optional, but recommended)
+export IRONBANK_USERNAME="your-ironbank-username"
+export IRONBANK_PASSWORD="your-ironbank-password"
+export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.mil
+
 # Option 2: Let the script prompt you for missing values
 ./bin/scan.sh
+
+# Option 3: Use OnePassword (default behavior if credentials not set)
+# The script will automatically fetch credentials from OnePassword
+# Use --skip-op to disable this behavior
 ```
 
 #### Basic Usage
 
 ```bash
-# Run vulnerability scan (packages are discovered automatically)
+# Run vulnerability scan with default settings
 ./bin/scan.sh
+
+# Run with debug output
+./bin/scan.sh --debug
+
+# Skip OnePassword credential retrieval (use env vars or prompts)
+./bin/scan.sh --skip-op
+
+# Skip version checking for faster scans
+./bin/scan.sh --skip-version-check
+
+# Custom output directory
+./bin/scan.sh --output /path/to/results
+
+# Exclude release candidate tags from version checking
+./bin/scan.sh --exclude-tags "(sha256|nightly|arm64|latest|rc)"
+
+# Show help
+./bin/scan.sh --help
 ```
 
+#### Command Line Options
+
+- `-h, --help` - Show help message and usage information
+- `-d, --debug` - Enable debug output for troubleshooting
+- `--skip-op` - Skip OnePassword credential retrieval (useful in CI/CD environments)
+- `--skip-version-check` - Skip checking for newer image versions (speeds up scanning)
+- `-o, --output DIR` - Specify output directory (default: `artifacts/`)
+- `--exclude-tags PATTERN` - Regex pattern for tags to exclude from version checking (default: `"(sha256|nightly|arm64|latest)"`)
+
 The script will:
+
 - Connect to your registry and discover all packages in the organization
 - Find the latest version of each package (prioritizing -unicorn tags)
 - Extract all images from the discovered packages
 - Scan each image for vulnerabilities with color-coded progress output
-- Check for newer versions of each image and report outdated images
+- Check for newer versions of each image and report outdated images (unless `--skip-version-check` is used)
 - Generate a comprehensive report
 
 Note: The script includes all package discovery logic internally, so `get_tags.sh` is not required.
@@ -137,6 +174,7 @@ Note: The script includes all package discovery logic internally, so `get_tags.s
 #### Color-Coded Output
 
 The script provides color-coded terminal output for better readability:
+
 - **Blue**: Progress indicators and informational messages
 - **Green**: Image names and success messages
 - **Yellow**: Warnings and newer version notifications
@@ -156,6 +194,7 @@ All output files are saved to the `artifacts/` directory:
   - Version check information showing if images are up-to-date or outdated
   - Overall vulnerability counts by severity
   - Risk scores and fixability metrics
+  - Errors section listing failed scans with package and image information
 - `scan_results_YYYYMMDD_HHMMSS.tar.gz` - Archive of all scan results
 - `errors.txt` - Images that failed to scan (if any)
 
@@ -189,8 +228,9 @@ A standalone utility script for discovering packages and their tags from your UD
 #### Prerequisites
 
 The script will prompt for any missing values:
+
 - `UDS_USERNAME` - Registry username
-- `UDS_PASSWORD` - Registry password  
+- `UDS_PASSWORD` - Registry password
 - `UDS_URL` - Registry URL
 - `ORGANIZATION` - Organization to scan (defaults to sld-45)
 
@@ -224,6 +264,11 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Risk score calculation and fixability analysis
 - ✅ Automatic version checking to identify outdated images
 - ✅ Color-coded terminal output for better readability
+- ✅ Command-line options for flexible usage
+- ✅ OnePassword integration for secure credential management
+- ✅ Support for multiple registries (UDS and Iron Bank)
+- ✅ Debug mode for troubleshooting
+- ✅ Configurable output directory
 - ✅ JSON and archived output formats
 - ✅ Error handling and retry logic
 - ✅ Full shellcheck compliance
@@ -252,7 +297,10 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - [Zarf](https://zarf.dev/) - For package inspection
 - [Grype](https://github.com/anchore/grype) - For vulnerability scanning
 - jq - For JSON processing
-- Valid credentials for accessing OCI registries
+- bc - For floating point calculations
+- curl - For registry API calls
+- OnePassword CLI (optional) - For secure credential management
+- Valid credentials for accessing OCI registries (UDS and Iron Bank)
 
 ### For generate-kbom.sh
 
@@ -282,12 +330,14 @@ uds-ssm stores session information in `~/.local/state/udsm/` for persistence acr
 ## Code Quality
 
 All scripts in this repository:
+
 - ✅ Pass shellcheck validation with no errors or warnings
 - ✅ Follow bash best practices
 - ✅ Include comprehensive error handling
 - ✅ Are well-documented with inline comments
 
 To verify code quality:
+
 ```bash
 shellcheck bin/*
 ```
