@@ -1,6 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
+
+# Source common variables and functions
+source "$(dirname "$(realpath "$0")")/common.sh"
 
 # This script scans all Kubernetes namespaces using Trivy and generates a KBOM (Kubernetes Bill of Materials).
 # Blog post: https://www.aquasec.com/blog/introducing-kbom-kubernetes-bill-of-materials/
@@ -41,23 +44,6 @@ cleanup() {
 
 # Run cleanup on exit, Ctrl+C, or termination
 trap cleanup EXIT INT TERM
-
-# utility functions
-info() {
-	echo -e "\033[1;34m$1\033[0m"
-}
-
-error() {
-	echo -e "\033[1;31mError: $1\033[0m" >&2
-}
-
-green() {
-	echo -e "\033[;32m$1\033[0m"
-}
-
-yellow() {
-	echo -e "\033[;33m$1\033[0m"
-}
 
 info "🦄 Starting Trivy scan of all Kubernetes namespaces 🦄"
 echo
@@ -104,6 +90,8 @@ read -r -p "Enter the output filename (default: ${cluster_name}-kbom.txt): " out
 if [ -z "$output_filename" ]; then
 	output_filename="${cluster_name}-kbom.txt"
 fi
+# Save to artifacts directory
+output_filepath="${artifacts_dir}/${output_filename}"
 
 # prompt user to enter the vulnerability severity levels to include
 read -r -p "Enter the vulnerability severity levels to include (comma-separated, default: CRITICAL,HIGH): " severity_levels
@@ -115,12 +103,12 @@ fi
 echo
 info "You have entered the following settings:"
 echo
-green "\tKubeconfig Path: $(yellow "$kubeconfig_path")"
-green "\tKubernetes Context: $(yellow "$kube_context")"
-green "\tZarf Docker Registry Service: $(yellow "$zarf_registry_svc")"
-green "\tZarf Docker Registry Port: $(yellow "$zarf_registry_port")"
-green "\tOutput Filename: $(yellow "$output_filename")"
-green "\tVulnerability Severity Levels: $(yellow "$severity_levels")"
+echo -e "\tKubeconfig Path: $kubeconfig_path"
+echo -e "\tKubernetes Context: $kube_context"
+echo -e "\tZarf Docker Registry Service: $zarf_registry_svc"
+echo -e "\tZarf Docker Registry Port: $zarf_registry_port"
+echo -e "\tOutput File: $output_filepath"
+echo -e "\tVulnerability Severity Levels: $severity_levels"
 echo
 read -r -p "Is this correct? (y/n): " confirm
 if [[ ! $confirm =~ ^[Yy]$ ]]; then
@@ -140,7 +128,7 @@ if [ "$current_context" != "${kube_context}" ]; then
 		exit 1
 	fi
 else
-	yellow "Already using the '${kube_context}' Kubernetes context."
+	info "Already using the '${kube_context}' Kubernetes context."
 fi
 echo
 export NO_COLOR=1
@@ -174,13 +162,13 @@ fi
 
 echo
 num_namespaces=$(echo "$namespaces" | wc -w)
-green "Number of namespaces to scan: $(yellow "$num_namespaces")"
+info "Number of namespaces to scan: $num_namespaces"
 echo
 
 info "Starting Trivy scan..."
 echo
 start_time=$(date +%s)
-if ! trivy kubernetes --report summary --insecure --output "${output_filename}" \
+if ! trivy kubernetes --report summary --insecure --output "${output_filepath}" \
 	--format table --disable-node-collector \
 	--include-namespaces "${namespaces// /,}" \
 	--ignore-unfixed --severity "${severity_levels}" \
@@ -195,6 +183,6 @@ fi
 
 echo
 info "Trivy scan completed successfully."
-yellow "Total time taken: $((end_time - start_time)) seconds"
-yellow "Output saved to: $(yellow "$output_filename")"
+info "Total time taken: $((end_time - start_time)) seconds"
+info "Output saved to: $output_filepath"
 echo

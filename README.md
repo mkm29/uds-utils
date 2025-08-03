@@ -100,35 +100,97 @@ eval $(uds-ssm env --session-id ssm-1234567890-12345)
 
 ### scan.sh
 
-A vulnerability scanning tool that uses Grype to scan container images from UDS packages.
+A vulnerability scanning tool that uses Grype to scan container images from UDS packages. It dynamically discovers packages from your registry.
+
+#### Prerequisites
+
+The script requires registry credentials. You can either set environment variables or the script will prompt you:
+
+```bash
+# Option 1: Set environment variables
+export UDS_USERNAME="your-username"
+export UDS_PASSWORD="your-password"
+export UDS_URL="registry.defenseunicorns.com"
+export ORGANIZATION="sld-45"  # Optional, defaults to sld-45
+
+# Option 2: Let the script prompt you for missing values
+./bin/scan.sh
+```
 
 #### Basic Usage
 
 ```bash
-# Run vulnerability scan on packages listed in packages.txt
+# Run vulnerability scan (packages are discovered automatically)
 ./bin/scan.sh
 ```
 
-#### Configuration
+The script will:
+- Connect to your registry and discover all packages in the organization
+- Find the latest version of each package (prioritizing -unicorn tags)
+- Extract all images from the discovered packages
+- Scan each image for vulnerabilities
+- Generate a comprehensive report
 
-1. Edit `packages.txt` to include the OCI packages you want to scan:
-
-```
-ghcr.io/defenseunicorns/packages/uds/uds-core:0.25.2-registry1
-ghcr.io/defenseunicorns/packages/uds/gitlab-runner:16.11.0-uds.0-registry1
-```
-
-2. Run the scan - it will:
-   - Extract all images from the specified packages
-   - Scan each image for vulnerabilities
-   - Generate a comprehensive report
+Note: The script includes all package discovery logic internally, so `get_tags.sh` is not required.
 
 #### Output Files
 
+All output files are saved to the `artifacts/` directory:
+
 - `images.txt` - List of all unique images found
-- `scan-results.json` - Aggregated vulnerability report
+- `scan-results.json` - Aggregated vulnerability report with:
+  - Complete package information (name, version, registry) for all discovered packages
+  - Vulnerability summary by severity for each package including totalRisk
+  - Each image result includes its source package details
+  - Overall vulnerability counts by severity
+  - Risk scores and fixability metrics
 - `scan_results_YYYYMMDD_HHMMSS.tar.gz` - Archive of all scan results
 - `errors.txt` - Images that failed to scan (if any)
+
+### generate-kbom.sh
+
+A tool for generating a Kubernetes Bill of Materials (KBOM) using Trivy to scan cluster resources.
+
+#### Basic Usage
+
+```bash
+# Run KBOM generation (interactive prompts)
+./bin/generate-kbom.sh
+```
+
+#### Features
+
+- Interactive configuration prompts
+- Automatic port-forwarding to Zarf registry
+- Namespace-specific or cluster-wide scanning
+- Configurable vulnerability severity levels
+- Summary report generation
+
+#### Output
+
+The KBOM report is saved to `artifacts/<cluster-name>-kbom.txt`
+
+### get_tags.sh
+
+A standalone utility script for discovering packages and their tags from your UDS registry. While `scan.sh` includes its own package discovery logic, this script is useful for exploring available packages and tags.
+
+#### Prerequisites
+
+The script will prompt for any missing values:
+- `UDS_USERNAME` - Registry username
+- `UDS_PASSWORD` - Registry password  
+- `UDS_URL` - Registry URL
+- `ORGANIZATION` - Organization to scan (defaults to sld-45)
+
+#### Basic Usage
+
+```bash
+# Display all packages and their latest versions
+./bin/get_tags.sh
+
+# Output just the package URLs (package mode)
+OUTPUT_MODE=packages ./bin/get_tags.sh
+```
 
 ## Features
 
@@ -150,6 +212,15 @@ ghcr.io/defenseunicorns/packages/uds/gitlab-runner:16.11.0-uds.0-registry1
 - ✅ JSON and archived output formats
 - ✅ Error handling and retry logic
 
+### generate-kbom.sh
+
+- ✅ Kubernetes cluster vulnerability scanning
+- ✅ Namespace-level granularity
+- ✅ Automatic Zarf registry port-forwarding
+- ✅ Configurable severity filtering
+- ✅ Interactive configuration wizard
+- ✅ Summary report generation
+
 ## Prerequisites
 
 ### For uds-ssm
@@ -165,6 +236,14 @@ ghcr.io/defenseunicorns/packages/uds/gitlab-runner:16.11.0-uds.0-registry1
 - [Grype](https://github.com/anchore/grype) - For vulnerability scanning
 - jq - For JSON processing
 - Valid credentials for accessing OCI registries
+
+### For generate-kbom.sh
+
+- [Trivy](https://github.com/aquasecurity/trivy) - For Kubernetes scanning
+- kubectl - Configured with cluster access
+- yq - For YAML processing
+- jq - For JSON processing
+- Zarf registry running in cluster
 
 ## Configuration
 
