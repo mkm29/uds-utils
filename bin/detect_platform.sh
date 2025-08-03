@@ -4,7 +4,8 @@
 
 # Get operating system
 get_os() {
-    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local os
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
     
     case "$os" in
         linux)   echo "linux" ;;
@@ -16,7 +17,8 @@ get_os() {
 
 # Get CPU architecture
 get_arch() {
-    local arch=$(uname -m)
+    local arch
+    arch=$(uname -m)
     
     case "$arch" in
         x86_64|amd64)    echo "amd64" ;;     # Intel/AMD 64-bit
@@ -58,7 +60,7 @@ case "${1:-}" in
         ;;
     -h|--help)
         cat <<EOF
-Usage: $(basename $0) [OPTIONS]
+Usage: $(basename "$0") [OPTIONS]
 
 Detect operating system and CPU architecture.
 
@@ -72,10 +74,10 @@ Options:
 Default: Output platform string (e.g., linux-amd64, darwin-arm64)
 
 Examples:
-  $(basename $0)              # Output: linux-amd64
-  $(basename $0) --os         # Output: linux
-  $(basename $0) --arch       # Output: amd64
-  $(basename $0) --separate   # Output: OS: linux
+  $(basename "$0")              # Output: linux-amd64
+  $(basename "$0") --os         # Output: linux
+  $(basename "$0") --arch       # Output: amd64
+  $(basename "$0") --separate   # Output: OS: linux
                               #         Architecture: amd64
 
 Common platforms:
