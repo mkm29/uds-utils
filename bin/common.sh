@@ -49,7 +49,7 @@ warning() {
 
 debug() {
 	if [[ "${DEBUG:-0}" == "1" ]]; then
-		echo -e "${CYAN}[DEBUG] ${WHITE}$1${NC}" >&2
+		echo -e "${CYAN}[DEBUG] ${WHITE}$1${NC}\n" >&2
 	fi
 }
 
