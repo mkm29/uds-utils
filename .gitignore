@@ -20,8 +20,4 @@ Thumbs.db
 *.log
 
 # Artifacts directory - ignore generated files
-artifacts/scan-results.json
-artifacts/errors.txt
-artifacts/scan_results_*.tar.gz
-artifacts/images.txt
-artifacts/*-kbom.txt
+artifacts/

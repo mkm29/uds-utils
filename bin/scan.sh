@@ -366,6 +366,28 @@ scan_image() {
 	white_no_newline "Scanning image: "
 	green "$image"
 
+	# Check if image has 'latest' tag
+	if [[ "$image" =~ :latest$ ]]; then
+		warning "  ⚠ WARNING: Image has 'latest' tag and will not be scanned"
+		# Track error with package info
+		local package_json="${image_to_package[$image]}"
+		local pkg_name="unknown"
+		if [[ -n "$package_json" ]]; then
+			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
+		fi
+		# Use jq to properly create JSON object
+		local error_obj
+		error_obj=$(jq -n \
+			--arg pkg "$pkg_name" \
+			--arg img "$image" \
+			--arg err "Image has 'latest' tag and was not scanned" \
+			'{package: $pkg, image: $img, error: $err}')
+		scan_errors+=("$error_obj")
+		((error_count++))
+		# Errors are tracked in scan_errors array and saved to scan-results.json
+		return 1
+	fi
+
 	# Check for latest version of the image
 	if [[ $SKIP_VERSION_CHECK -eq 0 ]]; then
 		echo "  Checking for latest version..."
@@ -406,7 +428,7 @@ scan_image() {
 	# Check if grype failed or if there are auth errors in the output
 	if [[ $grype_exit_code -ne 0 ]] || echo "$grype_output" | grep -q "401 UNAUTHORIZED\|UNAUTHORIZED: access to the requested resource is not authorized\|pull failed\|no host address"; then
 		error "Failed to scan image: $image (exit code: $grype_exit_code)"
-		echo "$image" >>errors.txt
+		# Errors are tracked in scan_errors array and saved to scan-results.json
 		# Track error with package info
 		local package_json="${image_to_package[$image]}"
 		local pkg_name="unknown"
@@ -430,7 +452,7 @@ scan_image() {
 	# Verify the JSON file was created and is valid
 	if [[ ! -f "$safe_filename" ]] || ! jq empty "$safe_filename" 2>/dev/null; then
 		error "Failed to create valid scan results for: $image"
-		echo "$image" >>errors.txt
+		# Errors are tracked in scan_errors array and saved to scan-results.json
 		# Track error with package info
 		local package_json="${image_to_package[$image]}"
 		local pkg_name="unknown"
@@ -483,8 +505,7 @@ scan_images() {
 	echo "Completed scanning $count images: $success_count successful, $error_count errors"
 
 	# If errors.txt exists, note it
-	if [[ -f errors.txt ]]; then
-		echo "Images with authentication errors saved to errors.txt"
+	if [[ ${#scan_errors[@]} -gt 0 ]]; then
 		echo "Detailed error information available in scan-results.json summary.errors section"
 	fi
 }
@@ -797,32 +818,33 @@ create_enhanced_packages_json() {
 		# Convert the delimited string to a JSON array
 		outdated_json_array="[]"
 		if [[ -n "$pkg_outdated" ]]; then
-			# Build JSON array properly without IFS manipulation
-			outdated_json_array="["
-			first_item=true
-			while [[ -n "$pkg_outdated" ]]; do
-				# Find the delimiter position
-				if [[ "$pkg_outdated" =~ ^(.*),DELIMITER,(.*)$ ]]; then
+			# Use a more robust approach with proper JSON handling
+			temp_array="[]"
+			remaining="$pkg_outdated"
+
+			while [[ -n "$remaining" ]]; do
+				# Find the delimiter position - look for the last occurrence to handle nested JSON
+				if [[ "$remaining" =~ ^(.+),DELIMITER,(.*)$ ]]; then
 					item="${BASH_REMATCH[1]}"
 					remaining="${BASH_REMATCH[2]}"
 				else
 					# Last item (no delimiter)
-					item="$pkg_outdated"
+					item="$remaining"
 					remaining=""
 				fi
 
-				if [ "$first_item" = true ]; then
-					first_item=false
+				# Validate that the item is valid JSON before adding
+				if echo "$item" | jq . >/dev/null 2>&1; then
+					# Add the item to the array using jq
+					temp_array=$(echo "$temp_array" | jq --argjson new_item "$item" '. + [$new_item]')
 				else
-					outdated_json_array+=","
+					debug "Warning: Invalid JSON item for package $pkg_name: $item"
 				fi
-				outdated_json_array+="$item"
 
-				# Move to the next item
-				pkg_outdated="$remaining"
-				[[ -z "$pkg_outdated" ]] && break
+				[[ -z "$remaining" ]] && break
 			done
-			outdated_json_array+="]"
+
+			outdated_json_array="$temp_array"
 		fi
 
 		# Debug the JSON array
@@ -952,19 +974,14 @@ create_output_archive() {
 
 	# Move the output files to the artifacts directory
 	# shellcheck disable=SC2154  # artifacts_dir is defined in common.sh
-	mv _images.txt "${OUTPUT_DIR}/images.txt"
 	mv "$tarball_name" "${OUTPUT_DIR}/"
 	cp scan-results.json "${OUTPUT_DIR}/scan-results.json"
 	rm -f scan-results.json
 
-	# Move errors.txt if it exists
-	if [[ -f errors.txt ]]; then
-		mv errors.txt "${OUTPUT_DIR}/"
-		echo "Error list saved to ${OUTPUT_DIR}/errors.txt"
-	fi
+	# Clean up temporary _images.txt file
+	rm -f _images.txt
 
-	echo "Image list saved to ${OUTPUT_DIR}/images.txt"
-	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package information)"
+	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package and image information)"
 	echo "Scan results tarball saved to ${OUTPUT_DIR}/$tarball_name"
 }
 
