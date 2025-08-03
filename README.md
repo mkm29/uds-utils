@@ -41,7 +41,7 @@ cd uds-utils
 2. Make the scripts executable:
 
 ```bash
-chmod +x bin/uds-ssm bin/scan.sh
+chmod +x bin/uds-ssm bin/scan.sh bin/letscerts.sh bin/generate-kbom.sh bin/get_tags.sh
 ```
 
 3. Add the `bin` directory to your PATH for global access:
@@ -100,7 +100,7 @@ eval $(uds-ssm env --session-id ssm-1234567890-12345)
 
 ### scan.sh
 
-A vulnerability scanning tool that uses Grype to scan container images from UDS packages. It dynamically discovers packages from your registry.
+A vulnerability scanning tool that uses Grype to scan container images from UDS packages. It dynamically discovers packages from your registry with intelligent version filtering and architecture support.
 
 #### Prerequisites
 
@@ -147,6 +147,9 @@ export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.m
 # Exclude release candidate tags from version checking
 ./bin/scan.sh --exclude-tags "(sha256|nightly|arm64|latest|rc)"
 
+# Specify target architecture (default: amd64)
+./bin/scan.sh --arch arm64
+
 # Show help
 ./bin/scan.sh --help
 ```
@@ -159,14 +162,18 @@ export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.m
 - `--skip-version-check` - Skip checking for newer image versions (speeds up scanning)
 - `-o, --output DIR` - Specify output directory (default: `artifacts/`)
 - `--exclude-tags PATTERN` - Regex pattern for tags to exclude from version checking (default: `"(sha256|nightly|arm64|latest)"`)
+- `--arch ARCH` - Specify target architecture for scanning (default: `amd64`)
 
 The script will:
 
 - Connect to your registry and discover all packages in the organization
 - Find the latest version of each package (prioritizing -unicorn tags)
-- Extract all images from the discovered packages
+- Extract all images from the discovered packages for the specified architecture
 - Scan each image for vulnerabilities with color-coded progress output
-- Check for newer versions of each image and report outdated images (unless `--skip-version-check` is used)
+- Check for newer versions with intelligent filtering:
+  - Architecture-specific tags (e.g., v1.2.3-arm64) are excluded when checking versions
+  - FIPS-certified images only compare against other FIPS versions
+  - Version patterns are matched to prevent unrelated tags from being considered
 - Generate a comprehensive report
 
 Note: The script includes all package discovery logic internally, so `get_tags.sh` is not required.
@@ -198,32 +205,59 @@ All output files are saved to the `artifacts/` directory:
 - `scan_results_YYYYMMDD_HHMMSS.tar.gz` - Archive of all scan results
 - `errors.txt` - Images that failed to scan (if any)
 
-### generate-kbom.sh
+### letscerts.sh
 
-A tool for generating a Kubernetes Bill of Materials (KBOM) using Trivy to scan cluster resources.
+A convenient tool for generating Let's Encrypt SSL certificates using Certbot with DNS or HTTP challenges.
 
 #### Basic Usage
 
 ```bash
-# Run KBOM generation (interactive prompts)
-./bin/generate-kbom.sh
+# Generate certificate with DNS challenge (interactive)
+./bin/letscerts.sh --domains "example.com www.example.com" --email admin@example.com
+
+# Use staging server for testing
+./bin/letscerts.sh --domains "example.com" --email admin@example.com --staging
+
+# Use HTTP challenge instead of DNS
+./bin/letscerts.sh --domains "example.com" --email admin@example.com --challenge HTTP
+
+# Custom key size
+./bin/letscerts.sh --domains "example.com" --email admin@example.com --key-size 2048
 ```
+
+#### Command Line Options
+
+- `-h, --help` - Display help message
+- `--domains` - Space-separated list of domains to include in the certificate
+- `--email` - Email address for Let's Encrypt registration
+- `--staging` - Use Let's Encrypt staging server (for testing)
+- `--production` - Use Let's Encrypt production server (default)
+- `--challenge` - Challenge type: DNS (default) or HTTP
+- `--key-size` - RSA key size (default: 4096)
 
 #### Features
 
-- Interactive configuration prompts
-- Automatic port-forwarding to Zarf registry
-- Namespace-specific or cluster-wide scanning
-- Configurable vulnerability severity levels
-- Summary report generation
+- Automatic Certbot installation if not present
+- Support for both DNS and HTTP challenges
+- Staging server support for testing
+- Organized certificate storage in `~/.letsencrypt/`
+- Color-coded output for better readability
+- Full shellcheck compliance
 
 #### Output
 
-The KBOM report is saved to `artifacts/<cluster-name>-kbom.txt`
+Certificates are stored in:
+- Configuration: `~/.letsencrypt/config/`
+- Working directory: `~/.letsencrypt/work/`
+- Logs: `~/.letsencrypt/log/`
 
 ### get_tags.sh
 
 A standalone utility script for discovering packages and their tags from your UDS registry. While `scan.sh` includes its own package discovery logic, this script is useful for exploring available packages and tags.
+
+### generate-kbom.sh
+
+A tool for generating a Kubernetes Bill of Materials (KBOM) using Trivy to scan cluster resources.
 
 #### Prerequisites
 
@@ -262,7 +296,11 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Automatic image extraction from Zarf packages
 - ✅ Comprehensive vulnerability reporting with severity levels
 - ✅ Risk score calculation and fixability analysis
-- ✅ Automatic version checking to identify outdated images
+- ✅ Intelligent version checking:
+  - Architecture-aware filtering (excludes arch-specific tags)
+  - FIPS version filtering (FIPS images only compare to FIPS)
+  - Pattern-based version matching to prevent false positives
+- ✅ Architecture support with --arch flag (default: amd64)
 - ✅ Color-coded terminal output for better readability
 - ✅ Command-line options for flexible usage
 - ✅ OnePassword integration for secure credential management
@@ -271,6 +309,16 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Configurable output directory
 - ✅ JSON and archived output formats
 - ✅ Error handling and retry logic
+- ✅ Full shellcheck compliance
+
+### letscerts.sh
+
+- ✅ Let's Encrypt certificate generation
+- ✅ DNS and HTTP challenge support
+- ✅ Staging server support for testing
+- ✅ Automatic Certbot installation
+- ✅ Organized certificate management
+- ✅ Color-coded output
 - ✅ Full shellcheck compliance
 
 ### generate-kbom.sh
@@ -302,6 +350,12 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - OnePassword CLI (optional) - For secure credential management
 - Valid credentials for accessing OCI registries (UDS and Iron Bank)
 
+### For letscerts.sh
+
+- [Certbot](https://certbot.eff.org/) - For Let's Encrypt certificate generation (auto-installed if missing)
+- Internet connectivity - For Let's Encrypt API access
+- DNS or HTTP access - For domain validation
+
 ### For generate-kbom.sh
 
 - [Trivy](https://github.com/aquasecurity/trivy) - For Kubernetes scanning
@@ -326,6 +380,17 @@ DEFAULT_PROFILE="jam-dev"
 ### Session State
 
 uds-ssm stores session information in `~/.local/state/udsm/` for persistence across command invocations.
+
+### Common Functions
+
+All scripts leverage a shared `common.sh` file that provides:
+
+- Consistent color-coded output functions (info, error, warning, success, debug)
+- Platform detection (OS and architecture)
+- Package manager abstraction for cross-platform installations
+- Registry login utilities
+- Argument parsing helpers
+- Project path management
 
 ## Code Quality
 
@@ -361,6 +426,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - Built for use with [UDS (Unicorn Delivery Service)](https://github.com/defenseunicorns/uds-core)
 - Uses [Grype](https://github.com/anchore/grype) for vulnerability scanning
+- Uses [Certbot](https://certbot.eff.org/) for Let's Encrypt certificate generation
 - Leverages AWS Systems Manager for secure connectivity
 
 ## Support
