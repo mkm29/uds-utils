@@ -16,6 +16,23 @@ else
 	info "Using existing UDS registry credentials."
 fi
 
+# get iron bank creds
+if [ -z "$IRONBANK_USERNAME" ] || [ -z "$IRONBANK_PASSWORD" ]; then
+	warning "Using OnePassword to fetch Iron Bank credentials..."
+	IRONBANK_USERNAME=$(op read "op://Iron Bank/kgzc6aovgdj5bi5mmboxxrbi3e/username")
+	export IRONBANK_USERNAME
+	IRONBANK_PASSWORD=$(op read "op://Iron Bank/kgzc6aovgdj5bi5mmboxxrbi3e/password")
+	export IRONBANK_PASSWORD
+else
+	info "Using existing Iron Bank credentials."
+fi
+
+echo "Logging into Iron Bank registry at $IRONBANK_URL with user $IRONBANK_USERNAME"
+if ! login_registry "$IRONBANK_USERNAME" "$IRONBANK_PASSWORD" "$IRONBANK_URL"; then
+	error "Failed to log in to Iron Bank registry. Please check your credentials and try again."
+	exit 1
+fi
+
 # Check and prompt for required environment variables if not set
 if [[ -z "$UDS_USERNAME" ]]; then
 	read -rp "Enter UDS registry username: " UDS_USERNAME
@@ -40,7 +57,7 @@ if [[ -z "$ORGANIZATION" ]]; then
 fi
 
 echo "Logging into UDS registry at https://$UDS_URL with user $UDS_USERNAME"
-if ! zarf tools registry login -u "$UDS_USERNAME" -p "$UDS_PASSWORD" "$UDS_URL" >/dev/null 2>&1; then
+if ! login_registry "$UDS_USERNAME" "$UDS_PASSWORD" "$UDS_URL"; then
 	error "Failed to log in to UDS registry. Please check your credentials and try again."
 	exit 1
 fi

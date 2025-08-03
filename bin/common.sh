@@ -74,8 +74,31 @@ white_no_newline() {
 	echo -en "\033[0;37m$1\033[0m"
 }
 
+# Function to login to a registry using zarf tools
+login_registry() {
+	local username="$1"
+	local password="$2"
+	local url="$3"
+	
+	# Validate arguments
+	if [[ -z "$username" || -z "$password" || -z "$url" ]]; then
+		error "login_registry requires 3 arguments: username, password, and URL"
+		return 1
+	fi
+	
+	# Login using password via stdin for security
+	if echo "$password" | zarf tools registry login -u "$username" --password-stdin "$url" >/dev/null 2>&1; then
+		success "Successfully logged into registry: $url"
+		return 0
+	else
+		error "Failed to login to registry: $url"
+		return 1
+	fi
+}
+
 # Export variables for use in sourcing scripts
 export UDS_URL="registry.defenseunicorns.com"
+export IRONBANK_URL="registry1.dso.mil"
 export script_path
 export script_dir
 export root_path
