@@ -13,6 +13,8 @@ SKIP_VERSION_CHECK=0
 OUTPUT_DIR=""
 # Default exclude pattern for version checking
 EXCLUDE_TAGS="(sha256|nightly|arm64|latest)"
+# Default architecture
+ARCH="amd64"
 
 # Print usage information
 print_usage() {
@@ -29,6 +31,7 @@ OPTIONS:
     -o, --output DIR        Output directory (default: artifacts/)
     --exclude-tags PATTERN  Regex pattern for tags to exclude from version checking
                            (default: "(sha256|nightly|arm64|latest)")
+    --arch ARCH             Architecture to scan (default: amd64)
     
 ENVIRONMENT VARIABLES:
     UDS_USERNAME            UDS registry username
@@ -44,6 +47,7 @@ EXAMPLES:
     $(basename "$0") --debug                                  # Run with debug output
     $(basename "$0") --skip-op                                # Skip OnePassword, use env vars or prompts
     $(basename "$0") --exclude-tags "(sha256|nightly|rc)"     # Custom tag exclusion pattern
+    $(basename "$0") --arch arm64                             # Scan for arm64 architecture
 
 EOF
 }
@@ -72,6 +76,10 @@ parse_args() {
 			;;
 		--exclude-tags)
 			EXCLUDE_TAGS="$2"
+			shift
+			;;
+		--arch)
+			ARCH="$2"
 			shift
 			;;
 		*)
@@ -228,11 +236,49 @@ check_latest_version() {
 	# Check if we can access the registry
 	debug "Checking latest version for: $registry_url/$image_path"
 
+	# Extract version pattern from current version for filtering
+	local version_pattern=""
+
+	# Pattern 1: Versions starting with 'v' followed by numbers (e.g., v18.2.1, v1.0.0)
+	if [[ "$current_version" =~ ^v[0-9] ]]; then
+		version_pattern="^v[0-9]"
+	# Pattern 2: Versions starting with numbers (e.g., 18.2.1, 2.1.0)
+	elif [[ "$current_version" =~ ^[0-9]+\.[0-9]+ ]]; then
+		version_pattern="^[0-9]+\.[0-9]+"
+	# Pattern 3: For versions with specific suffixes, match the base pattern
+	elif [[ "$current_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)- ]]; then
+		# Match versions with same base pattern (e.g., 25.7.0.110598-)
+		local base_pattern="${BASH_REMATCH[1]%%.*}"
+		version_pattern="^$base_pattern\."
+	else
+		# If no clear pattern, we cannot reliably check for updates
+		echo "CHECK_FAILED"
+		return
+	fi
+
 	# Try to list tags from the registry
 	local all_tags
-	if all_tags=$(zarf tools registry ls "$registry_url/$image_path" 2>/dev/null | grep -Ev "$EXCLUDE_TAGS"); then
-		# Successfully got tags, find the latest
-		latest_version=$(echo "$all_tags" | sort -V | tail -1)
+	if all_tags=$(zarf tools registry ls "$registry_url/$image_path" 2>/dev/null | grep -Ev "$EXCLUDE_TAGS" | grep -v "$ARCH"); then
+		# Filter tags that match the version pattern
+		local filtered_tags=""
+		if [ -n "$version_pattern" ]; then
+			filtered_tags=$(echo "$all_tags" | grep -E "$version_pattern" || true)
+		fi
+
+		# If current version contains "fips", only consider other fips versions
+		if [[ "$current_version" == *"fips"* ]]; then
+			filtered_tags=$(echo "$filtered_tags" | grep "fips" || true)
+			debug "Current version contains 'fips', filtering for fips versions only"
+		fi
+
+		# If no tags match the pattern, we cannot determine latest version
+		if [ -z "$filtered_tags" ]; then
+			echo "CHECK_FAILED"
+			return
+		fi
+
+		# Find the latest version among filtered tags
+		latest_version=$(echo "$filtered_tags" | sort -V | tail -1)
 
 		if [ -n "$latest_version" ] && [ "$latest_version" != "$current_version" ]; then
 			# Found a newer version
@@ -334,7 +380,7 @@ extract_images() {
 		white "$package_display"
 
 		# Get list of images for package
-		if ! images_from_package=$(zarf --log-level warn --no-color package inspect images oci://"$package" -a amd64 | sed 's/^- //'); then
+		if ! images_from_package=$(zarf --log-level warn --no-color package inspect images oci://"$package" -a "$ARCH" | sed 's/^- //'); then
 			error "Failed to inspect package: $package"
 			continue
 		fi
@@ -422,7 +468,7 @@ scan_image() {
 
 	# Capture grype output to check for auth errors
 	# Redirect stdin to /dev/null to prevent grype from consuming the while loop's input
-	grype_output=$(grype --platform linux/amd64 "$image" --output json --file "$safe_filename" </dev/null 2>&1)
+	grype_output=$(grype --platform "linux/$ARCH" "$image" --output json --file "$safe_filename" </dev/null 2>&1)
 	grype_exit_code=$?
 
 	# Check if grype failed or if there are auth errors in the output
