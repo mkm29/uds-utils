@@ -19,28 +19,63 @@ mkdir -p "$artifacts_dir"
 
 # Common utility functions for consistent output
 info() {
-    echo -e "\033[1;34m$1\033[0m"
+	echo -e "\033[1;34m$1\033[0m"
 }
 
 error() {
-    echo -e "\033[1;31mError: $1\033[0m" >&2
+	echo -e "\033[1;31mError: $1\033[0m" >&2
 }
 
 success() {
-    echo -e "\033[0;32m$1\033[0m"
+	echo -e "\033[0;32m$1\033[0m"
 }
 
 warning() {
-    echo -e "\033[0;33m$1\033[0m"
+	echo -e "\033[0;33m$1\033[0m"
 }
 
 debug() {
-    if [[ "${DEBUG:-0}" == "1" ]]; then
-        echo -e "\033[0;36mDebug: $1\033[0m" >&2
-    fi
+	if [[ "${DEBUG:-0}" == "1" ]]; then
+		echo -e "\033[0;36mDebug: $1\033[0m" >&2
+	fi
+}
+
+# Additional color functions for scan output
+blue() {
+	echo -e "\033[1;34m$1\033[0m"
+}
+
+green() {
+	echo -e "\033[0;32m$1\033[0m"
+}
+
+yellow() {
+	echo -e "\033[0;33m$1\033[0m"
+}
+
+white() {
+	echo -e "\033[0;37m$1\033[0m"
+}
+
+# Function to print without newline
+blue_no_newline() {
+	echo -en "\033[1;34m$1\033[0m"
+}
+
+green_no_newline() {
+	echo -en "\033[0;32m$1\033[0m"
+}
+
+yellow_no_newline() {
+	echo -en "\033[0;33m$1\033[0m"
+}
+
+white_no_newline() {
+	echo -en "\033[0;37m$1\033[0m"
 }
 
 # Export variables for use in sourcing scripts
+export UDS_URL="registry.defenseunicorns.com"
 export script_path
 export script_dir
 export root_path

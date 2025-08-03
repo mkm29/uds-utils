@@ -3,6 +3,8 @@
 set -euo pipefail
 
 # Source common variables and functions
+# shellcheck source=./common.sh
+# shellcheck disable=SC1091
 source "$(dirname "$(realpath "$0")")/common.sh"
 
 # This script scans all Kubernetes namespaces using Trivy and generates a KBOM (Kubernetes Bill of Materials).
@@ -91,6 +93,7 @@ if [ -z "$output_filename" ]; then
 	output_filename="${cluster_name}-kbom.txt"
 fi
 # Save to artifacts directory
+# shellcheck disable=SC2154  # artifacts_dir is defined in common.sh
 output_filepath="${artifacts_dir}/${output_filename}"
 
 # prompt user to enter the vulnerability severity levels to include

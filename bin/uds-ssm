@@ -108,7 +108,7 @@ preflight() {
 	if [ "$1" = "start" ]; then
 		deps+=(kubectl)
 	fi
-	
+
 	for cmd in "${deps[@]}"; do
 		if ! command -v "$cmd" >/dev/null 2>&1; then
 			echo "Error: $cmd is required but not installed or in PATH."
@@ -122,7 +122,7 @@ find_instance() {
 	local filter_value="$1"
 	local region="$2"
 	local profile="$3"
-	
+
 	AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
 		--filters "Name=tag:Name,Values=${filter_value}" \
 		--query "Reservations[0].Instances[0].InstanceId" \
@@ -133,7 +133,7 @@ find_instance() {
 setup_aws_env() {
 	local region="$1"
 	local profile="$2"
-	
+
 	export AWS_REGION="$region"
 	export AWS_PROFILE="$profile"
 }
@@ -148,36 +148,36 @@ parse_common_args() {
 	local filter_value="$DEFAULT_FILTER_VALUE"
 	local help_requested=false
 	local unknown_args=()
-	
+
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			--region|-r)
-				region="$2"
-				shift 2
-				;;
-			--profile|-p)
-				profile="$2"
-				shift 2
-				;;
-			--instance-id|-i)
-				instance_id="$2"
-				shift 2
-				;;
-			--filter|-f)
-				filter_value="$2"
-				shift 2
-				;;
-			--help|-h)
-				help_requested=true
-				shift
-				;;
-			*)
-				unknown_args+=("$1")
-				shift
-				;;
+		--region | -r)
+			region="$2"
+			shift 2
+			;;
+		--profile | -p)
+			profile="$2"
+			shift 2
+			;;
+		--instance-id | -i)
+			instance_id="$2"
+			shift 2
+			;;
+		--filter | -f)
+			filter_value="$2"
+			shift 2
+			;;
+		--help | -h)
+			help_requested=true
+			shift
+			;;
+		*)
+			unknown_args+=("$1")
+			shift
+			;;
 		esac
 	done
-	
+
 	# Output variable assignments for eval
 	cat <<EOF
 region="$region"
@@ -196,20 +196,20 @@ setup_instance_connection() {
 	local profile="$3"
 	local filter_value="$4"
 	local instance_id="$5"
-	
+
 	print_logo >&2
 	echo >&2
 	echo "Starting $cmd_name..." >&2
 	echo "Region: $region" >&2
 	echo "AWS Profile: $profile" >&2
 	echo >&2
-	
+
 	# Preflight checks
 	preflight "$cmd_name"
-	
+
 	# Setup AWS environment
 	setup_aws_env "$region" "$profile"
-	
+
 	# Find instance if not provided
 	if [ -z "$instance_id" ]; then
 		echo "Looking for instance with filter: $filter_value" >&2
@@ -219,13 +219,13 @@ setup_instance_connection() {
 			exit 1
 		fi
 	fi
-	
+
 	# Validate instance ID format
 	if ! [[ "$instance_id" =~ ^i-[0-9a-f]{8,17}$ ]]; then
 		echo "Error: Invalid instance ID format: $instance_id" >&2
 		exit 1
 	fi
-	
+
 	# Only output the instance ID to stdout
 	echo "$instance_id"
 }
@@ -234,11 +234,11 @@ setup_instance_connection() {
 context_exists() {
 	local context_name="$1"
 	local kubeconfig_file="$2"
-	
+
 	if [ ! -f "$kubeconfig_file" ]; then
 		return 1
 	fi
-	
+
 	KUBECONFIG="$kubeconfig_file" kubectl config get-contexts -o name 2>/dev/null | grep -q "^${context_name}$"
 }
 
@@ -247,23 +247,22 @@ merge_kubeconfig() {
 	local new_config="$1"
 	local target_config="$2"
 	local context_name="$3"
-	
+
 	if [ ! -f "$target_config" ]; then
 		echo "Creating new kubeconfig at $target_config"
 		cp "$new_config" "$target_config"
 		return
 	fi
-	
+
 	# Backup existing config
-	local backup_file="${target_config}.backup.$(date +%Y%m%d_%H%M%S)"
+	local backup_file
+	backup_file="${target_config}.backup.$(date +%Y%m%d_%H%M%S)"
 	echo "Backing up existing kubeconfig to $backup_file"
 	cp "$target_config" "$backup_file"
-	
+
 	# Use kubectl to merge configs
 	echo "Merging kubeconfig files..."
-	KUBECONFIG="${target_config}:${new_config}" kubectl config view --flatten > "${target_config}.tmp"
-	
-	if [ $? -eq 0 ]; then
+	if KUBECONFIG="${target_config}:${new_config}" kubectl config view --flatten >"${target_config}.tmp"; then
 		mv "${target_config}.tmp" "$target_config"
 		echo "Successfully merged kubeconfig into $target_config"
 	else
@@ -280,22 +279,22 @@ create_kubeconfig() {
 	local profile="$3"
 	local merge_config="$4"
 	local kubeconfig_file="$HOME/.kube/${cluster_name}-config"
-	
+
 	mkdir -p "$HOME/.kube"
-	
+
 	if [ -f "$kubeconfig_file" ]; then
 		echo "Kubeconfig file already exists at $kubeconfig_file"
 		echo "Do you want to overwrite it? (yes/no): "
 		read -r overwrite_confirmation
-		
+
 		if [[ "$overwrite_confirmation" != "yes" && "$overwrite_confirmation" != "y" ]]; then
 			echo "Skipping kubeconfig creation."
 			return
 		fi
 	fi
-	
+
 	echo "Creating kubeconfig file at $kubeconfig_file..."
-	cat > "$kubeconfig_file" <<EOF
+	cat >"$kubeconfig_file" <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -329,16 +328,15 @@ users:
       - name: AWS_PROFILE
         value: $profile
 EOF
-	
+
 	echo "Kubeconfig created at $kubeconfig_file"
-	
+
 	if [ "$merge_config" = "true" ]; then
 		# Check if context already exists
 		if context_exists "$cluster_name-context" "$HOME/.kube/config"; then
 			echo "Context '$cluster_name-context' already exists in ~/.kube/config"
 		else
-			merge_kubeconfig "$kubeconfig_file" "$HOME/.kube/config" "$cluster_name-context"
-			if [ $? -eq 0 ]; then
+			if merge_kubeconfig "$kubeconfig_file" "$HOME/.kube/config" "$cluster_name-context"; then
 				echo "Context '$cluster_name-context' has been added to ~/.kube/config"
 			fi
 		fi
@@ -357,8 +355,8 @@ save_session_info() {
 	local instance_id="$3"
 	local cluster_name="$4"
 	local temp_dir="$5"
-	
-	cat > "$STATE_DIR/${session_id}.json" <<EOF
+
+	cat >"$STATE_DIR/${session_id}.json" <<EOF
 {
   "session_id": "$session_id",
   "pid": "$pid",
@@ -373,21 +371,23 @@ EOF
 # Function to cleanup session
 cleanup_session() {
 	local session_file="$1"
-	
+
 	if [ -f "$session_file" ]; then
-		local pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
-		local temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
-		
+		local pid
+		pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
+		local temp_dir
+		temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
+
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 			echo "Terminating SSM session (PID: $pid)..."
 			kill -9 "$pid" 2>/dev/null
 		fi
-		
+
 		if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
 			echo "Cleaning up temporary directory: $temp_dir"
 			rm -rf "$temp_dir"
 		fi
-		
+
 		rm -f "$session_file"
 		# Also remove associated kubeconfig info
 		rm -f "${session_file%.json}.kubeconfig"
@@ -399,43 +399,43 @@ cleanup_session() {
 parse_start_args() {
 	# First parse common args
 	eval "$(parse_common_args "$@")"
-	
+
 	# Start-specific defaults
 	local cluster_name="$DEFAULT_CLUSTER_NAME"
 	local endpoint=""
 	local create_kubeconfig=false
 	local merge_kubeconfig=false
-	
+
 	# Re-parse for start-specific options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			--cluster-name|-c)
-				cluster_name="$2"
-				shift 2
-				;;
-			--endpoint|-e)
-				endpoint="$2"
-				shift 2
-				;;
-			--kubeconfig|-k)
-				create_kubeconfig=true
-				shift
-				;;
-			--merge|-m)
-				merge_kubeconfig=true
-				shift
-				;;
-			--region|-r|--profile|-p|--instance-id|-i|--filter|-f|--help|-h)
-				# Already handled by parse_common_args
-				shift
-				[[ "$1" =~ ^- ]] || shift
-				;;
-			*)
-				shift
-				;;
+		--cluster-name | -c)
+			cluster_name="$2"
+			shift 2
+			;;
+		--endpoint | -e)
+			endpoint="$2"
+			shift 2
+			;;
+		--kubeconfig | -k)
+			create_kubeconfig=true
+			shift
+			;;
+		--merge | -m)
+			merge_kubeconfig=true
+			shift
+			;;
+		--region | -r | --profile | -p | --instance-id | -i | --filter | -f | --help | -h)
+			# Already handled by parse_common_args
+			shift
+			[[ "$1" =~ ^- ]] || shift
+			;;
+		*)
+			shift
+			;;
 		esac
 	done
-	
+
 	# Output all variables
 	cat <<EOF
 region="$region"
@@ -454,16 +454,16 @@ EOF
 cmd_start() {
 	# Parse arguments
 	eval "$(parse_start_args "$@")"
-	
+
 	# Handle help
 	if [ "$help_requested" = "true" ]; then
 		show_start_usage
 		exit 0
 	fi
-	
+
 	# Setup AWS environment
 	setup_aws_env "$region" "$profile"
-	
+
 	print_logo
 	echo
 	echo "Starting SSM port forwarding session..."
@@ -471,10 +471,10 @@ cmd_start() {
 	echo "Region: $region"
 	echo "AWS Profile: $profile"
 	echo
-	
+
 	# Preflight checks
 	preflight "start"
-	
+
 	# Find instance if not provided
 	if [ -z "$instance_id" ]; then
 		echo "Looking for instance with filter: $filter_value"
@@ -484,7 +484,7 @@ cmd_start() {
 			exit 1
 		fi
 	fi
-	
+
 	# Get endpoint if not provided
 	if [ -z "$endpoint" ]; then
 		echo "Looking up EKS cluster endpoint..."
@@ -497,45 +497,47 @@ cmd_start() {
 			exit 1
 		fi
 	fi
-	
+
 	# Strip https:// prefix if present
 	endpoint=${endpoint#https://}
-	
+
 	echo "Instance ID: $instance_id"
 	echo "Endpoint: $endpoint"
-	
+
 	# Verify instance state
-	local instance_state=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
+	local instance_state
+	instance_state=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
 		--instance-ids "$instance_id" \
 		--query "Reservations[0].Instances[0].State.Name" \
 		--output text 2>/dev/null)
-	
+
 	if [ "$instance_state" != "running" ]; then
 		echo "Error: Instance $instance_id is not running. Current state: $instance_state"
 		exit 1
 	fi
-	
+
 	# Validate merge flag requires kubeconfig flag
 	if [ "$merge_kubeconfig" = "true" ] && [ "$create_kubeconfig" = "false" ]; then
 		echo "Error: --merge requires --kubeconfig to be specified"
 		exit 1
 	fi
-	
+
 	# Create kubeconfig if requested
 	if [ "$create_kubeconfig" = "true" ]; then
 		create_kubeconfig "$cluster_name" "$region" "$profile" "$merge_kubeconfig"
 	fi
-	
+
 	# Create temp directory for session
-	local temp_dir=$(mktemp -d -t udsm.XXXXXX)
+	local temp_dir
+	temp_dir=$(mktemp -d -t udsm.XXXXXX)
 	if [ ! -d "$temp_dir" ]; then
 		echo "Error: Failed to create temporary directory"
 		exit 1
 	fi
-	
+
 	local log_file="$temp_dir/session.log"
 	local pid_file="$temp_dir/session.pid"
-	
+
 	# Start SSM session
 	echo "Starting SSM port forwarding session..."
 	# Use env to ensure environment variables are properly set
@@ -544,16 +546,16 @@ cmd_start() {
 		--document-name AWS-StartPortForwardingSessionToRemoteHost \
 		--parameters "host=$endpoint,portNumber=443,localPortNumber=8443" \
 		>"$log_file" 2>&1 &
-	
+
 	local session_pid=$!
-	echo "$session_pid" > "$pid_file"
-	
+	echo "$session_pid" >"$pid_file"
+
 	# Wait for port to be available
 	echo "Waiting for port forwarding to establish..."
 	local max_attempts=30
 	local attempt=0
 	local port_ready=false
-	
+
 	while [ $attempt -lt $max_attempts ]; do
 		# Check if process is still running
 		if ! kill -0 $session_pid 2>/dev/null; then
@@ -563,22 +565,22 @@ cmd_start() {
 			rm -rf "$temp_dir"
 			exit 1
 		fi
-		
+
 		# Check if port is listening
 		if nc -z localhost 8443 2>/dev/null; then
 			port_ready=true
 			break
 		fi
-		
+
 		((attempt++))
 		sleep 1
-		
+
 		# Show progress
 		if [ $((attempt % 5)) -eq 0 ]; then
 			echo "  Still waiting... ($attempt/$max_attempts)"
 		fi
 	done
-	
+
 	if [ "$port_ready" = "false" ]; then
 		echo "Error: Port forwarding failed to establish after $max_attempts seconds"
 		echo "Session log:"
@@ -587,20 +589,21 @@ cmd_start() {
 		rm -rf "$temp_dir"
 		exit 1
 	fi
-	
+
 	# Generate session ID
-	local session_id="ssm-$(date +%s)-$$"
-	
+	local session_id
+	session_id="ssm-$(date +%s)-$$"
+
 	# Save session info
 	save_session_info "$session_id" "$session_pid" "$instance_id" "$cluster_name" "$temp_dir"
-	
+
 	# Store kubeconfig path if created
 	local kubeconfig_path=""
 	if [ "$create_kubeconfig" = "true" ] && [ "$merge_kubeconfig" = "false" ]; then
 		kubeconfig_path="$HOME/.kube/${cluster_name}-config"
-		echo "{\"kubeconfig_path\": \"$kubeconfig_path\"}" > "$STATE_DIR/${session_id}.kubeconfig"
+		echo "{\"kubeconfig_path\": \"$kubeconfig_path\"}" >"$STATE_DIR/${session_id}.kubeconfig"
 	fi
-	
+
 	echo
 	echo "✓ SSM session started successfully!"
 	echo "  Session ID: $session_id"
@@ -608,7 +611,7 @@ cmd_start() {
 	echo "  Log file: $log_file"
 	echo
 	echo "The EKS API server is now accessible at: https://localhost:8443"
-	
+
 	# Quick connectivity test
 	echo
 	echo "Testing connectivity..."
@@ -618,7 +621,7 @@ cmd_start() {
 		echo "⚠ Warning: Could not verify endpoint connectivity"
 		echo "  The port is open but the endpoint may still be initializing"
 	fi
-	
+
 	if [ "$create_kubeconfig" = "true" ]; then
 		echo
 		if [ "$merge_kubeconfig" = "true" ]; then
@@ -638,7 +641,7 @@ cmd_start() {
 			echo "  kubectl get nodes"
 		fi
 	fi
-	
+
 	echo
 	echo "To stop this session, run: $0 stop -s $session_id"
 }
@@ -647,32 +650,32 @@ cmd_start() {
 cmd_ssh() {
 	# Parse arguments
 	eval "$(parse_common_args "$@")"
-	
+
 	# Handle help
 	if [ "$help_requested" = "true" ]; then
 		show_ssh_usage
 		exit 0
 	fi
-	
+
 	# Check for unknown arguments
 	if [ ${#unknown_args[@]} -gt 0 ]; then
 		echo "Unknown option: ${unknown_args[0]}"
 		show_ssh_usage
 		exit 1
 	fi
-	
+
 	# Setup instance connection
 	instance_id=$(setup_instance_connection "shell session through SSM" "$region" "$profile" "$filter_value" "$instance_id")
-	
+
 	echo "Instance ID: $instance_id"
 	echo "Connecting..."
 	echo
 	echo "Note: Automatically switching to ec2-user. Type 'exit' to disconnect."
 	echo
-	
+
 	# Start SSM session with command to switch to ec2-user
 	local switch_user_cmd='sudo -i -u ec2-user'
-	
+
 	exec aws ssm start-session \
 		--target "$instance_id" \
 		--document-name AWS-StartInteractiveCommand \
@@ -683,30 +686,30 @@ cmd_ssh() {
 cmd_stop() {
 	local stop_all=false
 	local session_id=""
-	
+
 	# Parse stop command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			--all|-a)
-				stop_all=true
-				shift
-				;;
-			--session-id|-s)
-				session_id="$2"
-				shift 2
-				;;
-			--help|-h)
-				show_stop_usage
-				exit 0
-				;;
-			*)
-				echo "Unknown option: $1"
-				show_stop_usage
-				exit 1
-				;;
+		--all | -a)
+			stop_all=true
+			shift
+			;;
+		--session-id | -s)
+			session_id="$2"
+			shift 2
+			;;
+		--help | -h)
+			show_stop_usage
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1"
+			show_stop_usage
+			exit 1
+			;;
 		esac
 	done
-	
+
 	if [ "$stop_all" = "true" ]; then
 		echo "Stopping all SSM sessions..."
 		local count=0
@@ -737,39 +740,40 @@ cmd_stop() {
 # Env command implementation
 cmd_env() {
 	local session_id=""
-	
+
 	# Parse env command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			--session-id|-s)
-				session_id="$2"
-				shift 2
-				;;
-			--help|-h)
-				echo "Usage: $0 env [OPTIONS]"
-				echo ""
-				echo "Output environment variables for a session."
-				echo ""
-				echo "Options:"
-				echo "  -s, --session-id      Session ID to get environment for"
-				echo "  -h, --help            Show this help message"
-				exit 0
-				;;
-			*)
-				echo "Unknown option: $1"
-				exit 1
-				;;
+		--session-id | -s)
+			session_id="$2"
+			shift 2
+			;;
+		--help | -h)
+			echo "Usage: $0 env [OPTIONS]"
+			echo ""
+			echo "Output environment variables for a session."
+			echo ""
+			echo "Options:"
+			echo "  -s, --session-id      Session ID to get environment for"
+			echo "  -h, --help            Show this help message"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1"
+			exit 1
+			;;
 		esac
 	done
-	
+
 	if [ -z "$session_id" ]; then
 		echo "Error: --session-id is required"
 		exit 1
 	fi
-	
+
 	local kubeconfig_file="$STATE_DIR/${session_id}.kubeconfig"
 	if [ -f "$kubeconfig_file" ]; then
-		local kubeconfig_path=$(grep -o '"kubeconfig_path": "[^"]*"' "$kubeconfig_file" | sed 's/"kubeconfig_path": "//' | sed 's/"$//')
+		local kubeconfig_path
+		kubeconfig_path=$(grep -o '"kubeconfig_path": "[^"]*"' "$kubeconfig_file" | sed 's/"kubeconfig_path": "//' | sed 's/"$//')
 		if [ -n "$kubeconfig_path" ] && [ -f "$kubeconfig_path" ]; then
 			echo "export KUBECONFIG='$kubeconfig_path'"
 		else
@@ -786,60 +790,61 @@ cmd_env() {
 cmd_logs() {
 	local session_id=""
 	local follow=false
-	
+
 	# Parse logs command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-			--session-id|-s)
-				session_id="$2"
-				shift 2
-				;;
-			--follow|-f)
-				follow=true
-				shift
-				;;
-			--help|-h)
-				echo "Usage: $0 logs [OPTIONS]"
-				echo ""
-				echo "Show logs for a session."
-				echo ""
-				echo "Options:"
-				echo "  -s, --session-id      Session ID to show logs for (required)"
-				echo "  -f, --follow          Follow log output"
-				echo "  -h, --help            Show this help message"
-				exit 0
-				;;
-			*)
-				echo "Unknown option: $1"
-				exit 1
-				;;
+		--session-id | -s)
+			session_id="$2"
+			shift 2
+			;;
+		--follow | -f)
+			follow=true
+			shift
+			;;
+		--help | -h)
+			echo "Usage: $0 logs [OPTIONS]"
+			echo ""
+			echo "Show logs for a session."
+			echo ""
+			echo "Options:"
+			echo "  -s, --session-id      Session ID to show logs for (required)"
+			echo "  -f, --follow          Follow log output"
+			echo "  -h, --help            Show this help message"
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1"
+			exit 1
+			;;
 		esac
 	done
-	
+
 	if [ -z "$session_id" ]; then
 		echo "Error: --session-id is required"
 		exit 1
 	fi
-	
+
 	local session_file="$STATE_DIR/${session_id}.json"
 	if [ ! -f "$session_file" ]; then
 		echo "Error: Session not found: $session_id"
 		exit 1
 	fi
-	
-	local temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
+
+	local temp_dir
+	temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
 	local log_file="$temp_dir/session.log"
-	
+
 	if [ ! -f "$log_file" ]; then
 		echo "Error: Log file not found for session: $session_id"
 		echo "Expected location: $log_file"
 		exit 1
 	fi
-	
+
 	echo "Session: $session_id"
 	echo "Log file: $log_file"
 	echo "---"
-	
+
 	if [ "$follow" = "true" ]; then
 		tail -f "$log_file"
 	else
@@ -851,17 +856,22 @@ cmd_logs() {
 cmd_status() {
 	echo "Active SSM Sessions:"
 	echo
-	
+
 	local found=false
 	for session_file in "$STATE_DIR"/*.json; do
 		if [ -f "$session_file" ]; then
 			found=true
-			local session_id=$(basename "$session_file" .json)
-			local pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
-			local instance_id=$(grep -o '"instance_id": "[^"]*"' "$session_file" | sed 's/"instance_id": "//' | sed 's/"$//')
-			local cluster_name=$(grep -o '"cluster_name": "[^"]*"' "$session_file" | sed 's/"cluster_name": "//' | sed 's/"$//')
-			local started_at=$(grep -o '"started_at": "[^"]*"' "$session_file" | sed 's/"started_at": "//' | sed 's/"$//')
-			
+			local session_id
+			session_id=$(basename "$session_file" .json)
+			local pid
+			pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
+			local instance_id
+			instance_id=$(grep -o '"instance_id": "[^"]*"' "$session_file" | sed 's/"instance_id": "//' | sed 's/"$//')
+			local cluster_name
+			cluster_name=$(grep -o '"cluster_name": "[^"]*"' "$session_file" | sed 's/"cluster_name": "//' | sed 's/"$//')
+			local started_at
+			started_at=$(grep -o '"started_at": "[^"]*"' "$session_file" | sed 's/"started_at": "//' | sed 's/"$//')
+
 			# Check if process is still running
 			if kill -0 "$pid" 2>/dev/null; then
 				# Check if port is actually listening
@@ -871,14 +881,14 @@ cmd_status() {
 				else
 					port_status="not listening"
 				fi
-				
+
 				echo "  Session: $session_id"
 				echo "    PID: $pid (running)"
 				echo "    Port 8443: $port_status"
 				echo "    Instance: $instance_id"
 				echo "    Cluster: $cluster_name"
 				echo "    Started: $started_at"
-				
+
 				if [ "$port_status" = "not listening" ]; then
 					echo "    ⚠ Warning: Process running but port not accessible"
 				fi
@@ -889,7 +899,7 @@ cmd_status() {
 				echo "    Instance: $instance_id"
 				echo "    Cluster: $cluster_name"
 				echo "    Started: $started_at"
-				
+
 				# Check if temp dir exists for log access
 				if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
 					echo "    Log: $temp_dir/session.log"
@@ -902,7 +912,7 @@ cmd_status() {
 			fi
 		fi
 	done
-	
+
 	if [ "$found" = "false" ]; then
 		echo "  No active sessions found."
 	fi
@@ -915,39 +925,39 @@ main() {
 		show_usage
 		exit 0
 	fi
-	
+
 	local command="$1"
 	shift
-	
+
 	case "$command" in
-		start)
-			cmd_start "$@"
-			;;
-		ssh)
-			cmd_ssh "$@"
-			;;
-		stop)
-			cmd_stop "$@"
-			;;
-		status)
-			cmd_status "$@"
-			;;
-		env)
-			cmd_env "$@"
-			;;
-		logs)
-			cmd_logs "$@"
-			;;
-		help)
-			print_logo
-			show_usage
-			;;
-		*)
-			echo "Error: Unknown command: $command"
-			echo
-			show_usage
-			exit 1
-			;;
+	start)
+		cmd_start "$@"
+		;;
+	ssh)
+		cmd_ssh "$@"
+		;;
+	stop)
+		cmd_stop "$@"
+		;;
+	status)
+		cmd_status "$@"
+		;;
+	env)
+		cmd_env "$@"
+		;;
+	logs)
+		cmd_logs "$@"
+		;;
+	help)
+		print_logo
+		show_usage
+		;;
+	*)
+		echo "Error: Unknown command: $command"
+		echo
+		show_usage
+		exit 1
+		;;
 	esac
 }
 

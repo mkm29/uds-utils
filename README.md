@@ -128,10 +128,20 @@ The script will:
 - Connect to your registry and discover all packages in the organization
 - Find the latest version of each package (prioritizing -unicorn tags)
 - Extract all images from the discovered packages
-- Scan each image for vulnerabilities
+- Scan each image for vulnerabilities with color-coded progress output
+- Check for newer versions of each image and report outdated images
 - Generate a comprehensive report
 
 Note: The script includes all package discovery logic internally, so `get_tags.sh` is not required.
+
+#### Color-Coded Output
+
+The script provides color-coded terminal output for better readability:
+- **Blue**: Progress indicators and informational messages
+- **Green**: Image names and success messages
+- **Yellow**: Warnings and newer version notifications
+- **Red**: Errors and failures
+- **White**: General text and scan details
 
 #### Output Files
 
@@ -141,7 +151,9 @@ All output files are saved to the `artifacts/` directory:
 - `scan-results.json` - Aggregated vulnerability report with:
   - Complete package information (name, version, registry) for all discovered packages
   - Vulnerability summary by severity for each package including totalRisk
+  - List of outdated images for each package with current and latest versions
   - Each image result includes its source package details
+  - Version check information showing if images are up-to-date or outdated
   - Overall vulnerability counts by severity
   - Risk scores and fixability metrics
 - `scan_results_YYYYMMDD_HHMMSS.tar.gz` - Archive of all scan results
@@ -202,6 +214,7 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Automatic kubeconfig generation and management
 - ✅ Session status monitoring and logging
 - ✅ Multiple concurrent sessions support
+- ✅ Full shellcheck compliance
 
 ### scan.sh
 
@@ -209,8 +222,11 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Automatic image extraction from Zarf packages
 - ✅ Comprehensive vulnerability reporting with severity levels
 - ✅ Risk score calculation and fixability analysis
+- ✅ Automatic version checking to identify outdated images
+- ✅ Color-coded terminal output for better readability
 - ✅ JSON and archived output formats
 - ✅ Error handling and retry logic
+- ✅ Full shellcheck compliance
 
 ### generate-kbom.sh
 
@@ -220,6 +236,7 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Configurable severity filtering
 - ✅ Interactive configuration wizard
 - ✅ Summary report generation
+- ✅ Full shellcheck compliance
 
 ## Prerequisites
 
@@ -262,12 +279,26 @@ DEFAULT_PROFILE="jam-dev"
 
 uds-ssm stores session information in `~/.local/state/udsm/` for persistence across command invocations.
 
+## Code Quality
+
+All scripts in this repository:
+- ✅ Pass shellcheck validation with no errors or warnings
+- ✅ Follow bash best practices
+- ✅ Include comprehensive error handling
+- ✅ Are well-documented with inline comments
+
+To verify code quality:
+```bash
+shellcheck bin/*
+```
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
 1. Fork the repository
 1. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+1. Ensure your code passes shellcheck (`shellcheck your-script.sh`)
 1. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 1. Push to the branch (`git push origin feature/AmazingFeature`)
 1. Open a Pull Request
