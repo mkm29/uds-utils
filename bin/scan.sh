@@ -121,6 +121,7 @@ initialize_credentials() {
 	else
 		info "Using existing Iron Bank credentials."
 	fi
+	echo
 }
 
 # Prompt for missing credentials
@@ -145,6 +146,7 @@ prompt_for_credentials() {
 		read -rp "Enter organization name (default: sld-45): " ORGANIZATION
 		ORGANIZATION="${ORGANIZATION:-sld-45}"
 		export ORGANIZATION
+		echo
 	fi
 }
 
@@ -295,10 +297,12 @@ check_latest_version() {
 
 # Discover packages from registry
 discover_packages() {
-	info "Discovering packages dynamically from registry..."
-	echo "Registry: $UDS_URL"
-	echo "Organization: $ORGANIZATION"
+	echo
+	info "Registry: $UDS_URL"
+	info "Organization: $ORGANIZATION"
+	echo
 
+	info "Discovering packages dynamically from registry..."
 	info "Fetching repository catalog..."
 	catalog_response=$(curl -s -u "$UDS_USERNAME:$UDS_PASSWORD" "https://$UDS_URL/v2/_catalog")
 
@@ -306,6 +310,7 @@ discover_packages() {
 		error "Failed to fetch repository catalog from registry"
 		exit 1
 	fi
+	echo
 
 	# Extract repositories for the organization
 	repositories=$(echo "$catalog_response" | jq -r --arg org "$ORGANIZATION" '.repositories[] | select(startswith($org + "/"))')
@@ -369,6 +374,8 @@ extract_images() {
 
 	# Create associative array to track which package each image comes from
 	declare -gA image_to_package
+	echo
+	blue "Processing packages..."
 
 	for i in "${!packages[@]}"; do
 		package="${packages[$i]}"
@@ -376,8 +383,7 @@ extract_images() {
 
 		# Extract package name and version from the full registry path
 		package_display="${package##*/}"
-		blue_no_newline "Processing package: "
-		white "$package_display"
+		yellow "\t- $package_display"
 
 		# Get list of images for package
 		if ! images_from_package=$(zarf --log-level warn --no-color package inspect images oci://"$package" -a "$ARCH" | sed 's/^- //'); then
@@ -518,7 +524,8 @@ scan_image() {
 		return 1
 	fi
 
-	echo "Scan results saved to $safe_filename"
+	blue "Scans completed successfully."
+	echo -e "\nScan results saved to $safe_filename"
 	((success_count++))
 	return 0
 }
@@ -1053,7 +1060,8 @@ main() {
 
 	# Create temporary directory for processing
 	temp_dir=$(mktemp -d)
-	echo "Temporary directory created at: $temp_dir"
+	# if DEBUG is enabled, print the temp directory
+	debug "Temporary directory created at: $temp_dir"
 	trap 'rm -rf "$temp_dir"' EXIT
 
 	# Change to the temporary directory
