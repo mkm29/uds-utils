@@ -113,24 +113,29 @@ parse_args() {
 }
 
 usage() {
+	cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+Options:
+  -h, --help                  Display this help message
+	  --domains               List of domains to make a cert for (space-separated)
+	  --email                 Email to use for letsencrypt
+	  --staging               Use the staging server (default: false)
+	  --production            Use the production server (default: true)
+	  --challenge             Challenge type to use (DNS or HTTP, defaults to DNS)
+	  --key-size              Size of the key to generate (default: 4096)
+
+EXAMPLES:
+  $(basename "$0") --domains example.com www.example.com --email user@example.com
+  $(basename "$0") --domains staging.example.com --email user@example.com --staging --challenge DNS --key-size 2028
+  $(basename "$0") --domains example.com --email user@example.com --challenge HTTP
+EOF
 	echo
-	info "Usage: $0 [OPTIONS]"
-	echo
-	info "Options:"
-	echo
-	info "-h, --help                  Display this help message"
-	info "    --domains               List of domains to make a cert for"
-	info "    --email                 Email to use for letsencrypt"
-	info "    --staging               Use the staging server"
-	info "    --production            Use the production server"
-	info "    --challenge             Challenge type to use (DNS or HTTP, defaults to DNS)"
-	info "    --key-size              Size of the key to generate (default: 4096)"
 }
 
 main() {
 	print_logo
 	echo
-	info "Welcome to letscert.sh, setting up..."
+	green "Welcome to letscert.sh, setting up..."
 	setup
 	parse_args "$@"
 	local errs=false

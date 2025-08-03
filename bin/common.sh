@@ -55,19 +55,19 @@ debug() {
 
 # Additional color functions for scan output
 blue() {
-	echo -e "\033[1;34m$1\033[0m"
+	echo -e "\033[1;34m$1\033[0m\n"
 }
 
 green() {
-	echo -e "\033[0;32m$1\033[0m"
+	echo -e "\033[0;32m$1\033[0m\n"
 }
 
 yellow() {
-	echo -e "\033[0;33m$1\033[0m"
+	echo -e "\033[0;33m$1\033[0m\n"
 }
 
 white() {
-	echo -e "\033[0;37m$1\033[0m"
+	echo -e "\033[0;37m$1\033[0m\n"
 }
 
 # Function to print without newline
