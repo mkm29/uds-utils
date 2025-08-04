@@ -12,7 +12,7 @@ SKIP_VERSION_CHECK=0
 # OUTPUT_DIR will be set after sourcing common.sh or from command line
 OUTPUT_DIR=""
 # Default exclude pattern for version checking
-EXCLUDE_TAGS="(sha256|nightly|arm64|latest)"
+EXCLUDE_TAGS="(sha256|nightly|arm64|latest|ubi)"
 # Default architecture
 ARCH="amd64"
 
@@ -121,7 +121,7 @@ initialize_credentials() {
 	else
 		info "Using existing Iron Bank credentials."
 	fi
-	echo
+	echo >&2
 }
 
 # Prompt for missing credentials
@@ -133,7 +133,7 @@ prompt_for_credentials() {
 
 	if [[ -z "$UDS_PASSWORD" ]]; then
 		read -rsp "Enter UDS registry password: " UDS_PASSWORD
-		echo
+		echo >&2
 		export UDS_PASSWORD
 	fi
 
@@ -146,7 +146,7 @@ prompt_for_credentials() {
 		read -rp "Enter organization name (default: sld-45): " ORGANIZATION
 		ORGANIZATION="${ORGANIZATION:-sld-45}"
 		export ORGANIZATION
-		echo
+		echo >&2
 	fi
 }
 
@@ -154,7 +154,7 @@ prompt_for_credentials() {
 login_to_registries() {
 	# Login to Iron Bank if credentials are available
 	if [[ -n "$IRONBANK_USERNAME" && -n "$IRONBANK_PASSWORD" ]]; then
-		echo "Logging into Iron Bank registry at $IRONBANK_URL with user $IRONBANK_USERNAME"
+		echo "Logging into Iron Bank registry at $IRONBANK_URL with user $IRONBANK_USERNAME" >&2
 		if ! login_registry "$IRONBANK_USERNAME" "$IRONBANK_PASSWORD" "$IRONBANK_URL"; then
 			error "Failed to log in to Iron Bank registry. Please check your credentials and try again."
 			exit 1
@@ -164,7 +164,7 @@ login_to_registries() {
 	fi
 
 	# Login to UDS registry
-	echo "Logging into UDS registry at https://$UDS_URL with user $UDS_USERNAME"
+	echo "Logging into UDS registry at https://$UDS_URL with user $UDS_USERNAME" >&2
 	if ! login_registry "$UDS_USERNAME" "$UDS_PASSWORD" "$UDS_URL"; then
 		error "Failed to log in to UDS registry. Please check your credentials and try again."
 		exit 1
@@ -297,10 +297,10 @@ check_latest_version() {
 
 # Discover packages from registry
 discover_packages() {
-	echo
+	echo >&2
 	info "Registry: $UDS_URL"
 	info "Organization: $ORGANIZATION"
-	echo
+	echo >&2
 
 	info "Discovering packages dynamically from registry..."
 	info "Fetching repository catalog..."
@@ -310,7 +310,7 @@ discover_packages() {
 		error "Failed to fetch repository catalog from registry"
 		exit 1
 	fi
-	echo
+	echo >&2
 
 	# Extract repositories for the organization
 	repositories=$(echo "$catalog_response" | jq -r --arg org "$ORGANIZATION" '.repositories[] | select(startswith($org + "/"))')
@@ -374,7 +374,11 @@ extract_images() {
 
 	# Create associative array to track which package each image comes from
 	declare -gA image_to_package
-	echo
+	# Create associative array to track extracted OCI directories for each image
+	declare -gA image_to_oci_dir
+	# Create reverse mapping from OCI directories to image names
+	declare -gA oci_dir_to_image
+	echo >&2
 	blue "Processing packages..."
 
 	for i in "${!packages[@]}"; do
@@ -385,19 +389,74 @@ extract_images() {
 		package_display="${package##*/}"
 		yellow "\t- $package_display"
 
-		# Get list of images for package
-		if ! images_from_package=$(zarf --log-level warn --no-color package inspect images oci://"$package" -a "$ARCH" | sed 's/^- //'); then
-			error "Failed to inspect package: $package"
+		# Extract the package name without version for the filename
+		package_name="${package_display%%:*}"
+		package_version="${package_display##*:}"
+
+		# Pull the package
+		info "Pulling package: $package_display"
+
+		if ! zarf package pull "oci://$package" -a "$ARCH" --output-directory "$temp_dir" 2>/dev/null; then
+			error "Failed to pull package: $package"
 			continue
 		fi
 
-		# Store each image with its package association
-		while IFS= read -r image; do
-			[[ -z "$image" ]] && continue
-			echo "$image" >>_images.txt
-			# Store the package info JSON for this image
-			image_to_package["$image"]="$package_info_json"
-		done <<<"$images_from_package"
+		# Find the pulled package file
+		local pulled_package
+		pulled_package=$(find "$temp_dir" -name "zarf-package-${package_name}-*.tar.zst" -type f | head -1)
+
+		if [[ -z "$pulled_package" ]]; then
+			error "Could not find pulled package file for: $package"
+			continue
+		fi
+
+		info "Extracting OCI images from: $(basename "$pulled_package")"
+
+		# Extract all OCI images from the package
+		local package_extract_dir="$temp_dir/extracted_${package_name}"
+		local extracted_dirs
+		extracted_dirs=$(extract_all_oci_images "$pulled_package" "$package_extract_dir")
+
+		if [[ -z "$extracted_dirs" ]]; then
+			warning "No images extracted from package: $package"
+			continue
+		fi
+
+		# Process each extracted OCI directory
+		while IFS= read -r extracted_info; do
+			[[ -z "$extracted_info" ]] && continue
+
+			# Split the tab-separated values
+			local oci_dir="${extracted_info%%	*}"
+			local image_name="${extracted_info#*	}"
+
+			# Use the actual image name if available, otherwise use directory-based ID
+			local image_id
+			if [[ "$image_name" != "unknown" && -n "$image_name" ]]; then
+				image_id="$image_name"
+			else
+				image_id="oci-dir:${oci_dir}"
+			fi
+
+			# Add to our tracking arrays
+			echo "$image_id" >>_images.txt
+			image_to_package["$image_id"]="$package_info_json"
+			image_to_oci_dir["$image_id"]="$oci_dir"
+
+			# Create reverse mappings for both the directory and the image ID
+			oci_dir_to_image["$oci_dir"]="$image_id"
+
+			# Also map with oci-dir: prefix in case that's needed
+			image_to_package["oci-dir:${oci_dir}"]="$package_info_json"
+
+			debug "Mapped image $image_id to directory $oci_dir"
+			debug "Package info: $package_info_json"
+			debug "Reverse mapping: oci_dir_to_image[$oci_dir]=$image_id"
+			debug "Also mapped oci-dir:${oci_dir} to same package"
+		done <<<"$extracted_dirs"
+
+		# Clean up the pulled package file to save space
+		rm -f "$pulled_package"
 	done
 
 	# Remove duplicates from _images.txt (keeping first occurrence)
@@ -405,7 +464,7 @@ extract_images() {
 
 	# Count total images
 	total_images=$(grep -c . _images.txt || echo "0")
-	echo "Total images to scan: $total_images"
+	echo "Total images to scan: $total_images" >&2
 }
 
 # Scan a single image
@@ -418,8 +477,19 @@ scan_image() {
 	white_no_newline "Scanning image: "
 	green "$image"
 
-	# Check if image has 'latest' tag
-	if [[ "$image" =~ :latest$ ]]; then
+	# Check if we have an OCI directory mapping for this image
+	local is_oci_dir=false
+	local scan_target="$image"
+	local oci_dir="${image_to_oci_dir[$image]}"
+
+	if [[ -n "$oci_dir" ]]; then
+		is_oci_dir=true
+		scan_target="$oci_dir"
+		debug "Scanning OCI directory: $scan_target for image: $image"
+	fi
+
+	# Check if image has 'latest' tag (only for non-OCI directories)
+	if [[ "$is_oci_dir" == "false" && "$image" =~ :latest$ ]]; then
 		warning "  ⚠ WARNING: Image has 'latest' tag and will not be scanned"
 		# Track error with package info
 		local package_json="${image_to_package[$image]}"
@@ -442,7 +512,7 @@ scan_image() {
 
 	# Check for latest version of the image
 	if [[ $SKIP_VERSION_CHECK -eq 0 ]]; then
-		echo "  Checking for latest version..."
+		echo "  Checking for latest version..." >&2
 	fi
 	latest_version_result=$(check_latest_version "$image")
 	image_latest_versions["$image"]="$latest_version_result"
@@ -452,7 +522,7 @@ scan_image() {
 		success "  ✓ Image is already at the latest version"
 		;;
 	"SKIP_SHA256")
-		echo "  - Skipping version check (SHA256 digest)"
+		echo "  - Skipping version check (SHA256 digest)" >&2
 		;;
 	"PARSE_ERROR")
 		warning "  ⚠ Unable to parse image format"
@@ -461,7 +531,7 @@ scan_image() {
 		error "  ⚠ Failed to check for latest version"
 		;;
 	"SKIPPED")
-		echo "  - Version check skipped"
+		echo "  - Version check skipped" >&2
 		;;
 	*)
 		yellow_no_newline "  ⚠ Newer version available: "
@@ -474,7 +544,13 @@ scan_image() {
 
 	# Capture grype output to check for auth errors
 	# Redirect stdin to /dev/null to prevent grype from consuming the while loop's input
-	grype_output=$(grype --platform "linux/$ARCH" "$image" --output json --file "$safe_filename" </dev/null 2>&1)
+	if [[ "$is_oci_dir" == "true" ]]; then
+		# For OCI directories, use the oci-dir: prefix
+		grype_output=$(grype --platform "linux/$ARCH" "oci-dir:$scan_target" --output json --file "$safe_filename" </dev/null 2>&1)
+	else
+		# For regular images
+		grype_output=$(grype --platform "linux/$ARCH" "$scan_target" --output json --file "$safe_filename" </dev/null 2>&1)
+	fi
 	grype_exit_code=$?
 
 	# Check if grype failed or if there are auth errors in the output
@@ -525,7 +601,7 @@ scan_image() {
 	fi
 
 	blue "Scans completed successfully."
-	echo -e "\nScan results saved to $safe_filename"
+	echo -e "\nScan results saved to $safe_filename" >&2
 	((success_count++))
 	return 0
 }
@@ -545,6 +621,10 @@ scan_images() {
 	# Create associative array to store latest version info for each image
 	declare -gA image_latest_versions
 
+	# Ensure image_to_oci_dir and oci_dir_to_image are available globally
+	declare -gA image_to_oci_dir
+	declare -gA oci_dir_to_image
+
 	# Iterate over _images.txt and use Grype to scan each image
 	count=0
 	while IFS= read -r image; do
@@ -555,7 +635,7 @@ scan_images() {
 		scan_image "$image" "$count" "$total_images"
 	done <_images.txt
 
-	echo "Completed scanning $count images: $success_count successful, $error_count errors"
+	echo "Completed scanning $count images: $success_count successful, $error_count errors" >&2
 
 	# If errors.txt exists, note it
 	if [[ ${#scan_errors[@]} -gt 0 ]]; then
@@ -696,11 +776,39 @@ process_single_scan_result() {
 		# Get image name from the scan
 		image_name=$(jq -r '.source.target.userInput // "unknown"' "$json_file" 2>/dev/null || echo "unknown")
 
+		# Check if this is an OCI directory scan
+		local actual_image_name="$image_name"
+		# grype reports just the directory path in JSON output, not with oci-dir: prefix
+		if [[ -n "${oci_dir_to_image[$image_name]}" ]]; then
+			# This is an OCI directory path, get the actual image name
+			actual_image_name="${oci_dir_to_image[$image_name]}"
+			debug "Mapped OCI directory $image_name to image $actual_image_name"
+		elif [[ "$image_name" =~ ^oci-dir: ]]; then
+			# Handle case where it might have oci-dir: prefix
+			local oci_path="${image_name#oci-dir:}"
+			if [[ -n "${oci_dir_to_image[$oci_path]}" ]]; then
+				actual_image_name="${oci_dir_to_image[$oci_path]}"
+				debug "Mapped OCI directory $oci_path to image $actual_image_name"
+			fi
+		fi
+
 		# Get package info for this image
-		package_json="${image_to_package[$image_name]}"
+		package_json="${image_to_package[$actual_image_name]}"
+
+		# If not found and this is an OCI directory, try with oci-dir: prefix
+		if [[ -z "$package_json" && "$actual_image_name" != "$image_name" ]]; then
+			# Try looking up with oci-dir: prefix
+			local oci_dir_key="oci-dir:${image_name}"
+			package_json="${image_to_package[$oci_dir_key]}"
+			debug "Fallback lookup with oci-dir prefix: $oci_dir_key"
+		fi
+
+		# Debug: log the mapping
+		debug "Looking up package for image: $actual_image_name (original: $image_name)"
+		debug "Package JSON found: ${package_json:-NOT FOUND}"
 
 		# Get latest version info for this image
-		latest_version_info="${image_latest_versions[$image_name]}"
+		latest_version_info="${image_latest_versions[$actual_image_name]}"
 
 		# Update package vulnerability counts if we have package info
 		if [[ -n "$package_json" ]]; then
@@ -720,10 +828,10 @@ process_single_scan_result() {
 					"$latest_version_info" != "PARSE_ERROR" && "$latest_version_info" != "CHECK_FAILED" &&
 					"$latest_version_info" != "SKIPPED" ]]; then
 					# This is an outdated image
-					current_version=$(echo "$image_name" | grep -oE ':[^:]+$' | sed 's/^://')
+					current_version=$(echo "$actual_image_name" | grep -oE ':[^:]+$' | sed 's/^://')
 					# Use jq to properly create JSON object
 					outdated_entry=$(jq -n \
-						--arg img "$image_name" \
+						--arg img "$actual_image_name" \
 						--arg curr "$current_version" \
 						--arg latest "$latest_version_info" \
 						'{image: $img, currentVersion: $curr, latestVersion: $latest}')
@@ -741,7 +849,9 @@ process_single_scan_result() {
 		# Create an enhanced result object with summary only
 		{
 			echo "    {"
+			# Use the original image name from grype for display, but actual name for lookups
 			echo "      \"imageName\": \"$image_name\","
+			echo "      \"actualImageName\": \"$actual_image_name\","
 			echo "      \"scanFile\": \"$json_file\","
 
 			# Include package info if available
@@ -774,7 +884,13 @@ process_single_scan_result() {
 				;;
 			*)
 				echo "        \"status\": \"outdated\","
-				echo "        \"currentVersion\": \"$(echo "$image_name" | grep -oE ':[^:]+$' | sed 's/^://')\","
+				local current_ver
+				current_ver=$(echo "$actual_image_name" | grep -oE ':[^:]+$' | sed 's/^://' || echo "")
+				if [[ -z "$current_ver" && "$actual_image_name" != "$image_name" ]]; then
+					# For OCI directories, extract version from the actual image name
+					current_ver=$(echo "$actual_image_name" | grep -oE ':[^:]+$' | sed 's/^://' || echo "unknown")
+				fi
+				echo "        \"currentVersion\": \"$current_ver\","
 				echo "        \"latestVersion\": \"$latest_version_info\","
 				echo "        \"message\": \"Newer version available\""
 				;;
@@ -1005,12 +1121,12 @@ update_final_scan_results() {
 		# Clean up temp file
 		rm -f packages_temp.json
 
-		echo "Successfully created scan-results.json with $success_count scan results"
-		echo "Total vulnerabilities found: $total_vulnerabilities (Critical: $total_critical, High: $total_high, Medium: $total_medium, Low: $total_low)"
-		echo "Fixable vulnerabilities: $total_fixable | Unfixable vulnerabilities: $total_unfixable"
-		echo "Total cumulative risk score: $total_risk"
+		echo "Successfully created scan-results.json with $success_count scan results" >&2
+		echo "Total vulnerabilities found: $total_vulnerabilities (Critical: $total_critical, High: $total_high, Medium: $total_medium, Low: $total_low)" >&2
+		echo "Fixable vulnerabilities: $total_fixable | Unfixable vulnerabilities: $total_unfixable" >&2
+		echo "Total cumulative risk score: $total_risk" >&2
 	else
-		echo "Warning: scan-results.json may be malformed"
+		echo "Warning: scan-results.json may be malformed" >&2
 	fi
 }
 
@@ -1023,7 +1139,7 @@ create_output_archive() {
 	tarball_name="scan_results_$(date +%Y%m%d_%H%M%S).tar.gz"
 	# Use find to exclude temporary files
 	find . -maxdepth 1 -name "*.json" ! -name "all_vulnerabilities.json" ! -name "scan-results.json" -exec tar -czf "$tarball_name" {} +
-	echo "Scan results archived in $tarball_name"
+	echo "Scan results archived in $tarball_name" >&2
 
 	# Move the output files to the artifacts directory
 	# shellcheck disable=SC2154  # artifacts_dir is defined in common.sh
@@ -1034,8 +1150,8 @@ create_output_archive() {
 	# Clean up temporary _images.txt file
 	rm -f _images.txt
 
-	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package and image information)"
-	echo "Scan results tarball saved to ${OUTPUT_DIR}/$tarball_name"
+	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package and image information)" >&2
+	echo "Scan results tarball saved to ${OUTPUT_DIR}/$tarball_name" >&2
 }
 
 # Main function

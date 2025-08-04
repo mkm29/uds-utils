@@ -100,7 +100,7 @@ eval $(uds-ssm env --session-id ssm-1234567890-12345)
 
 ### scan.sh
 
-A vulnerability scanning tool that uses Grype to scan container images from UDS packages. It dynamically discovers packages from your registry with intelligent version filtering and architecture support.
+A vulnerability scanning tool that uses Grype to scan container images from UDS packages. It dynamically discovers packages from your registry, pulls the packages, extracts embedded OCI images, and scans them directly without needing to push/pull individual images to/from registries.
 
 #### Prerequisites
 
@@ -168,13 +168,14 @@ The script will:
 
 - Connect to your registry and discover all packages in the organization
 - Find the latest version of each package (prioritizing -unicorn tags)
-- Extract all images from the discovered packages for the specified architecture
-- Scan each image for vulnerabilities with color-coded progress output
+- Pull each package using `zarf package pull`
+- Extract embedded OCI images from the package archives
+- Scan each extracted OCI image directly using `grype oci-dir:<path>` for better performance
 - Check for newer versions with intelligent filtering:
   - Architecture-specific tags (e.g., v1.2.3-arm64) are excluded when checking versions
   - FIPS-certified images only compare against other FIPS versions
   - Version patterns are matched to prevent unrelated tags from being considered
-- Generate a comprehensive report
+- Generate a comprehensive report with proper package attribution
 
 Note: The script includes all package discovery logic internally, so `get_tags.sh` is not required.
 
@@ -247,6 +248,7 @@ A convenient tool for generating Let's Encrypt SSL certificates using Certbot wi
 #### Output
 
 Certificates are stored in:
+
 - Configuration: `~/.letsencrypt/config/`
 - Working directory: `~/.letsencrypt/work/`
 - Logs: `~/.letsencrypt/log/`
@@ -293,13 +295,16 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 ### scan.sh
 
 - ✅ Batch vulnerability scanning for OCI packages
-- ✅ Automatic image extraction from Zarf packages
+- ✅ Package pulling and OCI image extraction from Zarf packages
+- ✅ Direct scanning of extracted OCI directories (no registry push/pull needed)
+- ✅ Proper package attribution for all vulnerabilities
 - ✅ Comprehensive vulnerability reporting with severity levels
 - ✅ Risk score calculation and fixability analysis
 - ✅ Intelligent version checking:
   - Architecture-aware filtering (excludes arch-specific tags)
   - FIPS version filtering (FIPS images only compare to FIPS)
   - Pattern-based version matching to prevent false positives
+  - Works with images that have proper OCI annotations
 - ✅ Architecture support with --arch flag (default: amd64)
 - ✅ Color-coded terminal output for better readability
 - ✅ Command-line options for flexible usage
@@ -342,11 +347,12 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 
 ### For scan.sh
 
-- [Zarf](https://zarf.dev/) - For package inspection
-- [Grype](https://github.com/anchore/grype) - For vulnerability scanning
-- jq - For JSON processing
+- [Zarf](https://zarf.dev/) - For package pulling and inspection
+- [Grype](https://github.com/anchore/grype) - For vulnerability scanning (with OCI directory support)
+- jq - For JSON processing and OCI manifest parsing
 - bc - For floating point calculations
 - curl - For registry API calls
+- tar - For extracting package archives
 - OnePassword CLI (optional) - For secure credential management
 - Valid credentials for accessing OCI registries (UDS and Iron Bank)
 
@@ -391,6 +397,9 @@ All scripts leverage a shared `common.sh` file that provides:
 - Registry login utilities
 - Argument parsing helpers
 - Project path management
+- OCI image extraction utilities:
+  - `extract_oci_image` - Extract a single OCI image from a package by manifest digest
+  - `extract_all_oci_images` - Extract all OCI images from a package and return their paths with image names
 
 ## Code Quality
 
