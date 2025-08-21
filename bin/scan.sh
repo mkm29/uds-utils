@@ -9,6 +9,9 @@ source "$(dirname "$(realpath "$0")")/common.sh"
 DEBUG=0
 SKIP_ONEPASSWORD=0
 SKIP_VERSION_CHECK=0
+SKIP_VALIDATION=0 # Skip package validation
+INTERACTIVE=1     # Default to interactive mode
+AUTO_YES=0        # Auto-approve all packages
 # OUTPUT_DIR will be set after sourcing common.sh or from command line
 OUTPUT_DIR=""
 # Default exclude pattern for version checking
@@ -28,10 +31,13 @@ OPTIONS:
     -d, --debug             Enable debug output
     --skip-op               Skip OnePassword credential retrieval
     --skip-version-check    Skip checking for newer image versions
+    --skip-validation       Skip validation that packages exist in registry
     -o, --output DIR        Output directory (default: artifacts/)
     --exclude-tags PATTERN  Regex pattern for tags to exclude from version checking
                            (default: "(sha256|nightly|arm64|latest)")
     --arch ARCH             Architecture to scan (default: amd64)
+    -y, --yes               Auto-approve all packages (non-interactive mode)
+    --no-interactive        Disable interactive prompts (same as -y)
     
 ENVIRONMENT VARIABLES:
     UDS_USERNAME            UDS registry username
@@ -43,11 +49,12 @@ ENVIRONMENT VARIABLES:
     IRONBANK_URL            Iron Bank registry URL (default: registry1.dso.mil)
 
 EXAMPLES:
-    $(basename "$0")                                          # Run with default settings
+    $(basename "$0")                                          # Run with default settings (interactive)
     $(basename "$0") --debug                                  # Run with debug output
     $(basename "$0") --skip-op                                # Skip OnePassword, use env vars or prompts
     $(basename "$0") --exclude-tags "(sha256|nightly|rc)"     # Custom tag exclusion pattern
     $(basename "$0") --arch arm64                             # Scan for arm64 architecture
+    $(basename "$0") -y                                       # Auto-approve all packages
 
 EOF
 }
@@ -70,6 +77,9 @@ parse_args() {
 		--skip-version-check)
 			SKIP_VERSION_CHECK=1
 			;;
+		--skip-validation)
+			SKIP_VALIDATION=1
+			;;
 		-o | --output)
 			OUTPUT_DIR="$2"
 			shift
@@ -81,6 +91,14 @@ parse_args() {
 		--arch)
 			ARCH="$2"
 			shift
+			;;
+		-y | --yes)
+			AUTO_YES=1
+			INTERACTIVE=0
+			;;
+		--no-interactive)
+			INTERACTIVE=0
+			AUTO_YES=1
 			;;
 		*)
 			error "Unknown option: $1"
@@ -171,39 +189,7 @@ login_to_registries() {
 	fi
 }
 
-# Function to find the latest unicorn tag
-find_latest_unicorn_tag() {
-	local tags="$1"
-	# First try to find unicorn tags
-	local unicorn_tag
-	unicorn_tag=$(echo "$tags" | grep -E '\-unicorn$' | sort -V | tail -1)
-	if [ -n "$unicorn_tag" ]; then
-		echo "$unicorn_tag"
-		return
-	fi
-
-	# If no unicorn tag, find latest version-uds.X combination
-	local latest_tag
-	latest_tag=$(echo "$tags" |
-		grep -E '^[0-9]+\.[0-9]+\.[0-9]+-uds\.[0-9]+' |
-		sort -V | tail -1)
-
-	# If no uds versions, try regular versions
-	if [ -z "$latest_tag" ]; then
-		latest_tag=$(echo "$tags" |
-			grep -E '^[0-9]+\.[0-9]+\.[0-9]+' |
-			sort -V | tail -1)
-	fi
-
-	# Special handling for tags starting with 'v'
-	if [ -z "$latest_tag" ]; then
-		latest_tag=$(echo "$tags" |
-			grep -E '^v[0-9]+' |
-			sort -V | tail -1)
-	fi
-
-	echo "$latest_tag"
-}
+# Function to find the latest unicorn tag (kept for version checking functionality)
 
 # Function to check for the latest version of an image
 check_latest_version() {
@@ -232,6 +218,34 @@ check_latest_version() {
 	else
 		# Unable to parse image format
 		echo "PARSE_ERROR"
+		return
+	fi
+
+	# Check if we have credentials for this registry
+	# First check exact match
+	local has_credentials="${registry_has_credentials[$registry_url]:-unknown}"
+
+	# If not found, check if this might be a sub-path of a known registry
+	if [[ "$has_credentials" == "unknown" ]]; then
+		# Check if the image path starts with any known registry URL
+		for known_registry in "${!registry_has_credentials[@]}"; do
+			# Check if the image starts with this registry URL pattern
+			if [[ "$image" == "$known_registry"/* ]]; then
+				has_credentials="${registry_has_credentials[$known_registry]}"
+				debug "Found registry match: $known_registry for image $image"
+				break
+			fi
+		done
+	fi
+
+	if [[ "$has_credentials" == "false" ]]; then
+		debug "Skipping version check for $image - no credentials for registry"
+		echo "NO_CREDENTIALS"
+		return
+	elif [[ "$has_credentials" == "unknown" ]]; then
+		# Registry not in our list, skip version check
+		debug "Registry not in credentials list, skipping version check for $image"
+		echo "NO_CREDENTIALS"
 		return
 	fi
 
@@ -295,6 +309,25 @@ check_latest_version() {
 	fi
 }
 
+# Helper function to track scan errors consistently
+track_scan_error() {
+	local img="$1"
+	local err_msg="$2"
+	local package_json="${image_to_package[$img]}"
+	local pkg_name="unknown"
+	if [[ -n "$package_json" ]]; then
+		pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
+	fi
+	local error_obj
+	error_obj=$(jq -n \
+		--arg pkg "$pkg_name" \
+		--arg img "$img" \
+		--arg err "$err_msg" \
+		'{package: $pkg, image: $img, error: $err}')
+	scan_errors+=("$error_obj")
+	((error_count++))
+}
+
 # Discover packages from registry
 discover_packages() {
 	echo >&2
@@ -302,84 +335,233 @@ discover_packages() {
 	info "Organization: $ORGANIZATION"
 	echo >&2
 
-	info "Discovering packages dynamically from registry..."
-	info "Fetching repository catalog..."
-	catalog_response=$(curl -s -u "$UDS_USERNAME:$UDS_PASSWORD" "https://$UDS_URL/v2/_catalog")
+	info "Loading packages from versions.json..."
 
-	if ! catalog_response=$(curl -s -u "$UDS_USERNAME:$UDS_PASSWORD" "https://$UDS_URL/v2/_catalog") || [[ -z "$catalog_response" ]]; then
-		error "Failed to fetch repository catalog from registry"
+	# Look for versions.json in the script's parent directory (project root)
+	local script_dir
+	script_dir="$(dirname "$(realpath "$0")")"
+	local versions_file="${script_dir}/../versions.json"
+
+	if [[ ! -f "$versions_file" ]]; then
+		error "versions.json not found at: $versions_file"
 		exit 1
 	fi
+
+	# Read packages from versions.json
+	if ! versions_content=$(cat "$versions_file" 2>/dev/null); then
+		error "Failed to read versions.json"
+		exit 1
+	fi
+
+	# Validate JSON format
+	if ! echo "$versions_content" | jq empty 2>/dev/null; then
+		error "Invalid JSON format in versions.json"
+		exit 1
+	fi
+
+	# Load registry information into a global associative array
+	declare -gA registry_has_credentials
+	local registry_count
+	registry_count=$(echo "$versions_content" | jq '.registries | length' 2>/dev/null || echo 0)
+
+	if [[ "$registry_count" -gt 0 ]]; then
+		info "Loading registry credentials information..."
+		for i in $(seq 0 $((registry_count - 1))); do
+			local reg_name reg_url has_creds
+			reg_name=$(echo "$versions_content" | jq -r ".registries[$i].name")
+			reg_url=$(echo "$versions_content" | jq -r ".registries[$i].url")
+			has_creds=$(echo "$versions_content" | jq -r ".registries[$i].hasCredentials")
+
+			# Store by URL as that's what we'll match against
+			registry_has_credentials["$reg_url"]="$has_creds"
+			debug "Registry $reg_name ($reg_url): hasCredentials=$has_creds"
+		done
+	fi
+
+	# Process each package from versions.json - use global arrays
+	declare -ga packages=()
+	declare -ga package_info=()
+
+	# Get the number of packages
+	local package_count
+	package_count=$(echo "$versions_content" | jq '.packages | length')
+
+	if [[ "$package_count" -eq 0 ]]; then
+		error "No packages found in versions.json"
+		exit 1
+	fi
+
+	info "Found $package_count packages in versions.json"
 	echo >&2
 
-	# Extract repositories for the organization
-	repositories=$(echo "$catalog_response" | jq -r --arg org "$ORGANIZATION" '.repositories[] | select(startswith($org + "/"))')
+	# Process each package
+	for i in $(seq 0 $((package_count - 1))); do
+		# Extract package details
+		local pkg_name pkg_version pkg_environments
+		pkg_name=$(echo "$versions_content" | jq -r ".packages[$i].name")
+		pkg_version=$(echo "$versions_content" | jq -r ".packages[$i].version")
+		pkg_environments=$(echo "$versions_content" | jq -c ".packages[$i].environments")
 
-	if [[ -z "$repositories" ]]; then
-		error "No repositories found for organization: $ORGANIZATION"
-		exit 1
-	fi
+		# Build the registry path
+		local package="$UDS_URL/$ORGANIZATION/$pkg_name:$pkg_version"
+		packages+=("$package")
 
-	# Process each repository to find latest tags
-	packages=()
-	package_info=()
+		# Store package info as JSON object (including environments)
+		package_info+=("{\"name\": \"$pkg_name\", \"version\": \"$pkg_version\", \"registry\": \"$package\", \"environments\": $pkg_environments}")
 
-	while read -r repo; do
-		info "Processing repository: $repo"
-
-		# Get all tags for this repository
-		if ! all_tags=$(zarf tools registry ls "$UDS_URL/$repo" 2>/dev/null); then
-			warning "Failed to fetch tags for repository: $repo"
-			continue
-		fi
-
-		if [ -z "$all_tags" ]; then
-			warning "No tags found for $repo, skipping..."
-			continue
-		fi
-
-		# Find the latest tag
-		latest_tag=$(find_latest_unicorn_tag "$all_tags")
-
-		if [ -n "$latest_tag" ]; then
-			package="$UDS_URL/$repo:$latest_tag"
-			packages+=("$package")
-
-			# Extract package name and version
-			package_name="${repo##*/}"
-			package_version="$latest_tag"
-
-			# Store package info as JSON object
-			package_info+=("{\"name\": \"$package_name\", \"version\": \"$package_version\", \"registry\": \"$package\"}")
-
-			success "Found package: $package_name:$package_version"
-		else
-			warning "No valid version found for $repo"
-		fi
-	done <<<"$repositories"
+		success "Loaded package: $pkg_name:$pkg_version (environments: $(echo "$pkg_environments" | jq -r 'join(", ")'))"
+	done
 
 	# Check if any packages were loaded
 	if [[ ${#packages[@]} -eq 0 ]]; then
-		error "No packages discovered from registry"
+		error "No packages loaded from versions.json"
 		exit 1
 	fi
 
-	success "Discovered ${#packages[@]} packages from registry"
+	success "Loaded ${#packages[@]} packages from versions.json"
 	debug "Package info array has ${#package_info[@]} entries"
+
+	# Validate that all packages exist in the registry unless skipped
+	if [[ $SKIP_VALIDATION -eq 0 ]]; then
+		validate_packages
+	else
+		warning "Skipping package validation (--skip-validation flag set)"
+	fi
 }
 
-# Extract images from packages
-extract_images() {
-	local temp_dir="$1"
-
-	# Create associative array to track which package each image comes from
-	declare -gA image_to_package
-	# Create associative array to track extracted OCI directories for each image
-	declare -gA image_to_oci_dir
-	# Create reverse mapping from OCI directories to image names
-	declare -gA oci_dir_to_image
+# Validate that packages exist in the registry
+validate_packages() {
 	echo >&2
-	blue "Processing packages..."
+	info "Validating packages exist in registry..."
+
+	local missing_packages=()
+	local validation_errors=()
+
+	for i in "${!packages[@]}"; do
+		local package="${packages[$i]}"
+		local package_info_json="${package_info[$i]}"
+
+		# Extract package details
+		local package_display="${package##*/}"
+		local package_name="${package_display%%:*}"
+		local package_version="${package_display##*:}"
+
+		info "Checking: $package_name:$package_version"
+
+		# Parse the registry path
+		local registry_path="${package%:*}"
+
+		# Check if the package exists by listing tags
+		if ! zarf tools registry ls "$registry_path" 2>/dev/null | grep -q "^${package_version}$"; then
+			# Try with the full package URL in case it's a different format
+			if ! zarf tools registry ls "$package" 2>/dev/null >/dev/null; then
+				error "Package not found in registry: $package_name:$package_version"
+				missing_packages+=("$package_name:$package_version")
+				validation_errors+=("Package $package_name:$package_version not found at $registry_path")
+			else
+				success "✓ Found: $package_name:$package_version"
+			fi
+		else
+			success "✓ Found: $package_name:$package_version"
+		fi
+	done
+
+	echo >&2
+
+	# Report results
+	if [[ ${#missing_packages[@]} -gt 0 ]]; then
+		error "Validation failed! The following packages were not found in the registry:"
+		for missing in "${missing_packages[@]}"; do
+			error "  - $missing"
+		done
+		echo >&2
+		error "Please update versions.json with valid package versions."
+		echo >&2
+
+		# Show detailed errors
+		if [[ ${#validation_errors[@]} -gt 0 ]]; then
+			warning "Detailed errors:"
+			for err in "${validation_errors[@]}"; do
+				echo "  - $err" >&2
+			done
+			echo >&2
+		fi
+
+		error "Exiting due to validation failures."
+		exit 1
+	fi
+
+	success "All packages validated successfully!"
+}
+
+# Prompt user for package confirmation
+prompt_for_package() {
+	local package_name="$1"
+	local package_version="$2"
+	local environments="$3"
+
+	# If auto-yes is enabled, return success
+	if [[ $AUTO_YES -eq 1 ]]; then
+		return 0
+	fi
+
+	# If not interactive, skip by default
+	if [[ $INTERACTIVE -eq 0 ]]; then
+		return 1
+	fi
+
+	echo >&2
+	blue "Package: $package_name"
+	white "  Version: $package_version"
+	if [[ -n "$environments" && "$environments" != "null" && "$environments" != "[]" ]]; then
+		white "  Environments: $environments"
+	fi
+
+	while true; do
+		read -rp "Do you want to scan this package? (y/n/a) [y=yes, n=no, a=yes to all]: " response
+		case "$response" in
+		[yY] | [yY][eE][sS] | "")
+			return 0
+			;;
+		[nN] | [nN][oO])
+			return 1
+			;;
+		[aA] | [aA][lL][lL])
+			AUTO_YES=1
+			INTERACTIVE=0
+			info "Auto-approving all remaining packages"
+			return 0
+			;;
+		*)
+			warning "Please answer y (yes), n (no), or a (all)"
+			;;
+		esac
+	done
+}
+
+# Process packages one at a time
+process_packages() {
+	local working_dir="$1"
+
+	# Initialize global tracking arrays - use -g to make them truly global
+	declare -gA image_to_package
+	declare -gA image_to_oci_dir
+	declare -gA oci_dir_to_image
+	declare -gA image_latest_versions
+	declare -ga skipped_packages=()
+	declare -ga scan_errors=()
+
+	# Initialize counters as global
+	declare -g error_count=0
+	declare -g success_count=0
+	declare -g total_images=0
+
+	# Record start time for scan duration as global
+	declare -g scan_start_time
+	scan_start_time=$(date +%s)
+
+	echo >&2
+	blue "Processing packages one at a time..."
 
 	for i in "${!packages[@]}"; do
 		package="${packages[$i]}"
@@ -387,84 +569,131 @@ extract_images() {
 
 		# Extract package name and version from the full registry path
 		package_display="${package##*/}"
-		yellow "\t- $package_display"
-
-		# Extract the package name without version for the filename
 		package_name="${package_display%%:*}"
 		package_version="${package_display##*:}"
 
-		# Pull the package
-		info "Pulling package: $package_display"
+		# Extract environments from package info
+		local environments_display=""
+		if [[ -n "$package_info_json" ]]; then
+			environments_display=$(echo "$package_info_json" | jq -r '.environments | join(", ")' 2>/dev/null || echo "")
+		fi
 
-		if ! zarf package pull "oci://$package" -a "$ARCH" --output-directory "$temp_dir" 2>/dev/null; then
-			error "Failed to pull package: $package"
+		# Prompt user for confirmation
+		if ! prompt_for_package "$package_name" "$package_version" "$environments_display"; then
+			warning "Skipping package: $package_display"
+			skipped_packages+=("$package_name:$package_version")
 			continue
 		fi
 
-		# Find the pulled package file
-		local pulled_package
-		pulled_package=$(find "$temp_dir" -name "zarf-package-${package_name}-*.tar.zst" -type f | head -1)
+		yellow "\nProcessing package: $package_display"
 
-		if [[ -z "$pulled_package" ]]; then
-			error "Could not find pulled package file for: $package"
-			continue
+		# Create a temporary directory for this package
+		local package_temp_dir
+		package_temp_dir=$(mktemp -d "${working_dir}/pkg_${package_name}_XXXXXX")
+		debug "Created temporary directory for $package_name: $package_temp_dir"
+
+		# Process this single package
+		if process_single_package "$package" "$package_info_json" "$package_temp_dir" "$working_dir"; then
+			success "Completed processing package: $package_display"
+		else
+			error "Failed to process package: $package_display"
 		fi
 
-		info "Extracting OCI images from: $(basename "$pulled_package")"
-
-		# Extract all OCI images from the package
-		local package_extract_dir="$temp_dir/extracted_${package_name}"
-		local extracted_dirs
-		extracted_dirs=$(extract_all_oci_images "$pulled_package" "$package_extract_dir")
-
-		if [[ -z "$extracted_dirs" ]]; then
-			warning "No images extracted from package: $package"
-			continue
-		fi
-
-		# Process each extracted OCI directory
-		while IFS= read -r extracted_info; do
-			[[ -z "$extracted_info" ]] && continue
-
-			# Split the tab-separated values
-			local oci_dir="${extracted_info%%	*}"
-			local image_name="${extracted_info#*	}"
-
-			# Use the actual image name if available, otherwise use directory-based ID
-			local image_id
-			if [[ "$image_name" != "unknown" && -n "$image_name" ]]; then
-				image_id="$image_name"
-			else
-				image_id="oci-dir:${oci_dir}"
-			fi
-
-			# Add to our tracking arrays
-			echo "$image_id" >>_images.txt
-			image_to_package["$image_id"]="$package_info_json"
-			image_to_oci_dir["$image_id"]="$oci_dir"
-
-			# Create reverse mappings for both the directory and the image ID
-			oci_dir_to_image["$oci_dir"]="$image_id"
-
-			# Also map with oci-dir: prefix in case that's needed
-			image_to_package["oci-dir:${oci_dir}"]="$package_info_json"
-
-			debug "Mapped image $image_id to directory $oci_dir"
-			debug "Package info: $package_info_json"
-			debug "Reverse mapping: oci_dir_to_image[$oci_dir]=$image_id"
-			debug "Also mapped oci-dir:${oci_dir} to same package"
-		done <<<"$extracted_dirs"
-
-		# Clean up the pulled package file to save space
-		rm -f "$pulled_package"
+		# Clean up the package-specific temporary directory
+		info "Cleaning up temporary files for $package_name..."
+		rm -rf "$package_temp_dir"
+		debug "Removed temporary directory: $package_temp_dir"
+		echo >&2
 	done
 
-	# Remove duplicates from _images.txt (keeping first occurrence)
-	sort -u _images.txt -o _images.txt
+	echo "Completed processing all packages: $success_count successful scans, $error_count errors" >&2
 
-	# Count total images
-	total_images=$(grep -c . _images.txt || echo "0")
-	echo "Total images to scan: $total_images" >&2
+	# Report skipped packages if any
+	if [[ ${#skipped_packages[@]} -gt 0 ]]; then
+		echo >&2
+		warning "Skipped ${#skipped_packages[@]} packages:"
+		for skipped in "${skipped_packages[@]}"; do
+			echo "  - $skipped" >&2
+		done
+	fi
+}
+
+# Process a single package
+process_single_package() {
+	local package="$1"
+	local package_info_json="$2"
+	local temp_dir="$3"
+	local working_dir="$4"
+
+	local package_display="${package##*/}"
+	local package_name="${package_display%%:*}"
+	local package_version="${package_display##*:}"
+
+	# Pull the package
+	info "Pulling package: $package_display"
+	if ! zarf package pull "oci://$package" -a "$ARCH" --output-directory "$temp_dir" 2>/dev/null; then
+		error "Failed to pull package: $package"
+		return 1
+	fi
+
+	# Find the pulled package file
+	local pulled_package
+	pulled_package=$(find "$temp_dir" -name "zarf-package-${package_name}-*.tar.zst" -type f | head -1)
+
+	if [[ -z "$pulled_package" ]]; then
+		error "Could not find pulled package file for: $package"
+		return 1
+	fi
+
+	info "Extracting OCI images from: $(basename "$pulled_package")"
+
+	# Extract all OCI images from the package
+	local package_extract_dir="$temp_dir/extracted"
+	local extracted_dirs
+	extracted_dirs=$(extract_all_oci_images "$pulled_package" "$package_extract_dir")
+
+	if [[ -z "$extracted_dirs" ]]; then
+		warning "No images extracted from package: $package"
+		return 1
+	fi
+
+	# Clean up the pulled package file immediately to save space
+	rm -f "$pulled_package"
+	debug "Removed pulled package file to save space"
+
+	# Process and scan each extracted OCI directory
+	local package_images_count=0
+	while IFS= read -r extracted_info; do
+		[[ -z "$extracted_info" ]] && continue
+
+		# Split the tab-separated values
+		local oci_dir="${extracted_info%%	*}"
+		local image_name="${extracted_info#*	}"
+
+		# Use the actual image name if available, otherwise use directory-based ID
+		local image_id
+		if [[ "$image_name" != "unknown" && -n "$image_name" ]]; then
+			image_id="$image_name"
+		else
+			image_id="oci-dir:${oci_dir}"
+		fi
+
+		# Track the image
+		image_to_package["$image_id"]="$package_info_json"
+		image_to_oci_dir["$image_id"]="$oci_dir"
+		oci_dir_to_image["$oci_dir"]="$image_id"
+		image_to_package["oci-dir:${oci_dir}"]="$package_info_json"
+
+		((total_images++))
+		((package_images_count++))
+
+		# Scan this image immediately
+		cd "$working_dir" || return 1
+		scan_image "$image_id" "$total_images" "$total_images"
+	done <<<"$extracted_dirs"
+
+	info "Scanned $package_images_count images from package $package_name"
+	return 0
 }
 
 # Scan a single image
@@ -491,22 +720,7 @@ scan_image() {
 	# Check if image has 'latest' tag (only for non-OCI directories)
 	if [[ "$is_oci_dir" == "false" && "$image" =~ :latest$ ]]; then
 		warning "  ⚠ WARNING: Image has 'latest' tag and will not be scanned"
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Image has 'latest' tag and was not scanned" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
-		# Errors are tracked in scan_errors array and saved to scan-results.json
+		track_scan_error "$image" "Image has 'latest' tag and was not scanned"
 		return 1
 	fi
 
@@ -533,6 +747,9 @@ scan_image() {
 	"SKIPPED")
 		echo "  - Version check skipped" >&2
 		;;
+	"NO_CREDENTIALS")
+		echo "  - Version check skipped (no registry credentials)" >&2
+		;;
 	*)
 		yellow_no_newline "  ⚠ Newer version available: "
 		yellow "$latest_version_result"
@@ -556,23 +773,7 @@ scan_image() {
 	# Check if grype failed or if there are auth errors in the output
 	if [[ $grype_exit_code -ne 0 ]] || echo "$grype_output" | grep -q "401 UNAUTHORIZED\|UNAUTHORIZED: access to the requested resource is not authorized\|pull failed\|no host address"; then
 		error "Failed to scan image: $image (exit code: $grype_exit_code)"
-		# Errors are tracked in scan_errors array and saved to scan-results.json
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Scan failed with exit code $grype_exit_code" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
-		# Remove the empty/invalid JSON file if created
+		track_scan_error "$image" "Scan failed with exit code $grype_exit_code"
 		[[ -f "$safe_filename" ]] && rm -f "$safe_filename"
 		return 1
 	fi
@@ -580,22 +781,7 @@ scan_image() {
 	# Verify the JSON file was created and is valid
 	if [[ ! -f "$safe_filename" ]] || ! jq empty "$safe_filename" 2>/dev/null; then
 		error "Failed to create valid scan results for: $image"
-		# Errors are tracked in scan_errors array and saved to scan-results.json
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Failed to create valid scan results" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
+		track_scan_error "$image" "Failed to create valid scan results"
 		[[ -f "$safe_filename" ]] && rm -f "$safe_filename"
 		return 1
 	fi
@@ -606,51 +792,33 @@ scan_image() {
 	return 0
 }
 
-# Scan all images
-scan_images() {
-	# Initialize error tracking
-	error_count=0
-	success_count=0
-
-	# Initialize global array for scan errors
-	declare -ga scan_errors=()
-
-	# Record start time for scan duration
-	scan_start_time=$(date +%s)
-
-	# Create associative array to store latest version info for each image
-	declare -gA image_latest_versions
-
-	# Ensure image_to_oci_dir and oci_dir_to_image are available globally
-	declare -gA image_to_oci_dir
-	declare -gA oci_dir_to_image
-
-	# Iterate over _images.txt and use Grype to scan each image
-	count=0
-	while IFS= read -r image; do
-		# Skip empty lines
-		[[ -z "$image" ]] && continue
-
-		count=$((count + 1))
-		scan_image "$image" "$count" "$total_images"
-	done <_images.txt
-
-	echo "Completed scanning $count images: $success_count successful, $error_count errors" >&2
-
-	# If errors.txt exists, note it
-	if [[ ${#scan_errors[@]} -gt 0 ]]; then
-		echo "Detailed error information available in scan-results.json summary.errors section"
-	fi
-}
-
 # Process scan results and create combined report
 process_scan_results() {
-	echo "Combining scan results into scan-results.json..."
+	local timestamp
+	timestamp=$(date +"%Y%m%d-%H%M%S")
+	local scan_results_file="scan-results-${timestamp}.json"
+	echo "Combining scan results into $scan_results_file..."
+
+	# Ensure global variables are available with safe defaults
+	local total_packages=0
+	if [[ -n "${packages+x}" ]]; then
+		total_packages=${#packages[@]}
+	fi
+
+	local skipped_count=0
+	if [[ -n "${skipped_packages+x}" ]]; then
+		skipped_count=${#skipped_packages[@]}
+	fi
+
+	local images_scanned=${total_images:-0}
+	local successful=${success_count:-0}
+	local failed=${error_count:-0}
 
 	# Get current timestamp and calculate scan duration
 	scan_timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 	scan_end_time=$(date +%s)
-	scan_duration=$((scan_end_time - scan_start_time))
+	# scan_start_time is now set in process_packages function
+	scan_duration=$((scan_end_time - ${scan_start_time:-0}))
 
 	# Create a temporary file to collect all vulnerabilities
 	echo '[]' >all_vulnerabilities.json
@@ -675,33 +843,40 @@ process_scan_results() {
 	declare -A package_outdated_images
 
 	# Initialize package vulnerability counters
-	for pkg_info in "${package_info[@]}"; do
-		pkg_name=$(echo "$pkg_info" | jq -r '.name')
-		package_critical["$pkg_name"]=0
-		package_high["$pkg_name"]=0
-		package_medium["$pkg_name"]=0
-		package_low["$pkg_name"]=0
-		package_negligible["$pkg_name"]=0
-		package_unknown["$pkg_name"]=0
-		package_risk["$pkg_name"]=0
-		package_outdated_images["$pkg_name"]=""
-	done
+	if [[ -n "${package_info+x}" ]]; then
+		for pkg_info in "${package_info[@]}"; do
+			pkg_name=$(echo "$pkg_info" | jq -r '.name')
+			package_critical["$pkg_name"]=0
+			package_high["$pkg_name"]=0
+			package_medium["$pkg_name"]=0
+			package_low["$pkg_name"]=0
+			package_negligible["$pkg_name"]=0
+			package_unknown["$pkg_name"]=0
+			package_risk["$pkg_name"]=0
+			package_outdated_images["$pkg_name"]=""
+		done
+	fi
+
+	# Get grype version once
+	local grype_version
+	grype_version=$(grype --version 2>/dev/null | cut -d' ' -f2 || echo 'unknown')
 
 	# Start building the JSON structure
-	cat >scan-results.json <<EOF
+	cat >"$scan_results_file" <<EOF
 {
   "metadata": {
     "scanTimestamp": "$scan_timestamp",
     "scanDurationSeconds": $scan_duration,
     "scanDuration": "${scan_duration}s",
-    "totalImagesScanned": $count,
-    "successfulScans": $success_count,
-    "failedScans": $error_count,
-    "grypeVersion": "$(grype --version 2>/dev/null | cut -d' ' -f2 || echo 'unknown')"
+    "totalImagesScanned": $images_scanned,
+    "successfulScans": $successful,
+    "failedScans": $failed,
+    "skippedPackages": $skipped_count,
+    "grypeVersion": "$grype_version"
   },
   "summary": {
     "packages": [],
-    "totalPackages": ${#packages[@]},
+    "totalPackages": $total_packages,
     "vulnerabilitiesBySeverity": {
       "critical": 0,
       "high": 0,
@@ -722,8 +897,8 @@ EOF
 	# Process each JSON file and extract vulnerability counts
 	first=true
 	for json_file in *.json; do
-		# Skip the scan-results.json file itself and temporary files
-		[[ "$json_file" == "scan-results.json" ]] && continue
+		# Skip the scan-results files and temporary files
+		[[ "$json_file" == scan-results*.json ]] && continue
 		[[ "$json_file" == "all_vulnerabilities.json" ]] && continue
 
 		if [[ -f "$json_file" ]]; then
@@ -731,7 +906,7 @@ EOF
 			if [[ "$first" == "true" ]]; then
 				first=false
 			else
-				echo "," >>scan-results.json
+				echo "," >>"$scan_results_file"
 			fi
 
 			# Process the scan file (implementation continues as in original)
@@ -740,8 +915,8 @@ EOF
 	done
 
 	# Close the scan results array
-	echo "  ]" >>scan-results.json
-	echo "}" >>scan-results.json
+	echo "  ]" >>"$scan_results_file"
+	echo "}" >>"$scan_results_file"
 
 	# Calculate totals and update summary (implementation continues as in original)
 	finalize_scan_results
@@ -882,6 +1057,10 @@ process_single_scan_result() {
 				echo "        \"status\": \"skipped\","
 				echo "        \"message\": \"Version check disabled\""
 				;;
+			"NO_CREDENTIALS")
+				echo "        \"status\": \"skipped\","
+				echo "        \"message\": \"Version check skipped - no registry credentials\""
+				;;
 			*)
 				echo "        \"status\": \"outdated\","
 				local current_ver
@@ -908,12 +1087,14 @@ process_single_scan_result() {
 			echo "        \"totalRisk\": $total_risk"
 			echo "      }"
 			echo "    }"
-		} >>scan-results.json
+		} >>"$scan_results_file"
 	fi
 }
 
 # Finalize scan results with totals and package summaries
 finalize_scan_results() {
+	# scan_results_file is already set at the beginning of this function
+
 	# Calculate the total counts from all collected severities
 	if [[ -f all_severities.txt ]]; then
 		# Count severities (case-insensitive)
@@ -950,7 +1131,7 @@ finalize_scan_results() {
 	total_vulnerabilities=$((total_critical + total_high + total_medium + total_low + total_negligible + total_unknown))
 	total_unfixable=$((total_vulnerabilities - total_fixable))
 
-	# Update scan-results.json with final values
+	# Update scan results file with final values
 	update_final_scan_results
 }
 
@@ -958,6 +1139,14 @@ finalize_scan_results() {
 create_enhanced_packages_json() {
 	packages_json_enhanced="["
 	first_pkg=true
+
+	# Check if package_info array exists and has elements
+	if [[ -z "${package_info+x}" ]] || [[ ${#package_info[@]} -eq 0 ]]; then
+		debug "No package_info available for enhanced JSON"
+		packages_json_enhanced="[]"
+		return
+	fi
+
 	debug "Starting to process ${#package_info[@]} packages for enhanced JSON"
 
 	for pkg_info in "${package_info[@]}"; do
@@ -1090,12 +1279,12 @@ update_final_scan_results() {
 	fi
 
 	# Use jq to update the summary values and replace the packages placeholder
-	if jq empty scan-results.json 2>/dev/null && jq empty packages_temp.json 2>/dev/null; then
+	if jq empty "$scan_results_file" 2>/dev/null && jq empty packages_temp.json 2>/dev/null; then
 		# Read packages array and update the entire summary
 		packages_array=$(cat packages_temp.json)
 
 		# Update the JSON file with all summary values including packages and errors
-		debug "Updating scan-results.json with packages array and errors"
+		debug "Updating $scan_results_file with packages array and errors"
 		if jq --argjson packages "$packages_array" \
 			--argjson errors "$errors_json" \
 			".summary.packages = \$packages |
@@ -1109,11 +1298,11 @@ update_final_scan_results() {
         .summary.totalVulnerabilities = $total_vulnerabilities |
         .summary.fixableVulnerabilities = $total_fixable |
         .summary.unfixableVulnerabilities = $total_unfixable |
-        .summary.totalRisk = $total_risk" scan-results.json >grype-results-temp.json; then
-			mv grype-results-temp.json scan-results.json
-			debug "Successfully updated scan-results.json with package information and errors"
+        .summary.totalRisk = $total_risk" "$scan_results_file" >grype-results-temp.json; then
+			mv grype-results-temp.json "$scan_results_file"
+			debug "Successfully updated $scan_results_file with package information and errors"
 		else
-			error "Failed to update scan-results.json with package information"
+			error "Failed to update $scan_results_file with package information"
 			debug "jq command failed - checking packages_array content"
 			debug "packages_array length: ${#packages_array}"
 		fi
@@ -1121,13 +1310,16 @@ update_final_scan_results() {
 		# Clean up temp file
 		rm -f packages_temp.json
 
-		echo "Successfully created scan-results.json with $success_count scan results" >&2
+		echo "Successfully created $scan_results_file with $successful scan results" >&2
 		echo "Total vulnerabilities found: $total_vulnerabilities (Critical: $total_critical, High: $total_high, Medium: $total_medium, Low: $total_low)" >&2
 		echo "Fixable vulnerabilities: $total_fixable | Unfixable vulnerabilities: $total_unfixable" >&2
 		echo "Total cumulative risk score: $total_risk" >&2
 	else
-		echo "Warning: scan-results.json may be malformed" >&2
+		echo "Warning: $scan_results_file may be malformed" >&2
 	fi
+
+	# Export the filename for use in create_output_archive
+	export FINAL_SCAN_RESULTS_FILE="$scan_results_file"
 }
 
 # Create output archive and move files
@@ -1138,19 +1330,19 @@ create_output_archive() {
 	# Create tarball for all json files (excluding temporary files)
 	tarball_name="scan_results_$(date +%Y%m%d_%H%M%S).tar.gz"
 	# Use find to exclude temporary files
-	find . -maxdepth 1 -name "*.json" ! -name "all_vulnerabilities.json" ! -name "scan-results.json" -exec tar -czf "$tarball_name" {} +
+	find . -maxdepth 1 -name "*.json" ! -name "all_vulnerabilities.json" ! -name "scan-results*.json" -exec tar -czf "$tarball_name" {} +
 	echo "Scan results archived in $tarball_name" >&2
 
 	# Move the output files to the artifacts directory
 	# shellcheck disable=SC2154  # artifacts_dir is defined in common.sh
 	mv "$tarball_name" "${OUTPUT_DIR}/"
-	cp scan-results.json "${OUTPUT_DIR}/scan-results.json"
-	rm -f scan-results.json
+	cp "$scan_results_file" "${OUTPUT_DIR}/$scan_results_file"
+	rm -f "$scan_results_file"
 
 	# Clean up temporary _images.txt file
 	rm -f _images.txt
 
-	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package and image information)" >&2
+	echo "Combined scan results saved to ${OUTPUT_DIR}/$scan_results_file (includes package and image information)" >&2
 	echo "Scan results tarball saved to ${OUTPUT_DIR}/$tarball_name" >&2
 }
 
@@ -1171,23 +1363,20 @@ main() {
 	# Login to registries
 	login_to_registries
 
-	# Discover packages from registry
+	# Discover packages from versions.json and validate they exist
 	discover_packages
 
-	# Create temporary directory for processing
-	temp_dir=$(mktemp -d)
-	# if DEBUG is enabled, print the temp directory
-	debug "Temporary directory created at: $temp_dir"
-	trap 'rm -rf "$temp_dir"' EXIT
+	# Create main working directory for processing
+	working_dir=$(mktemp -d)
+	debug "Main working directory created at: $working_dir"
+	trap 'rm -rf "$working_dir"' EXIT
 
-	# Change to the temporary directory
-	cd "$temp_dir" || exit 1
+	# Change to the working directory
+	cd "$working_dir" || exit 1
 
-	# Extract images from packages
-	extract_images "$temp_dir"
-
-	# Scan all images
-	scan_images
+	# Process packages one at a time (pull, extract, scan, cleanup)
+	# Note: packages and package_info arrays are already declared as global in discover_packages
+	process_packages "$working_dir"
 
 	# Process scan results and create combined report
 	process_scan_results
