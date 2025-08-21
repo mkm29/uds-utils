@@ -190,39 +190,6 @@ login_to_registries() {
 }
 
 # Function to find the latest unicorn tag (kept for version checking functionality)
-# shellcheck disable=SC2329
-find_latest_unicorn_tag() {
-	local tags="$1"
-	# First try to find unicorn tags
-	local unicorn_tag
-	unicorn_tag=$(echo "$tags" | grep -E '\-unicorn$' | sort -V | tail -1)
-	if [ -n "$unicorn_tag" ]; then
-		echo "$unicorn_tag"
-		return
-	fi
-
-	# If no unicorn tag, find latest version-uds.X combination
-	local latest_tag
-	latest_tag=$(echo "$tags" |
-		grep -E '^[0-9]+\.[0-9]+\.[0-9]+-uds\.[0-9]+' |
-		sort -V | tail -1)
-
-	# If no uds versions, try regular versions
-	if [ -z "$latest_tag" ]; then
-		latest_tag=$(echo "$tags" |
-			grep -E '^[0-9]+\.[0-9]+\.[0-9]+' |
-			sort -V | tail -1)
-	fi
-
-	# Special handling for tags starting with 'v'
-	if [ -z "$latest_tag" ]; then
-		latest_tag=$(echo "$tags" |
-			grep -E '^v[0-9]+' |
-			sort -V | tail -1)
-	fi
-
-	echo "$latest_tag"
-}
 
 # Function to check for the latest version of an image
 check_latest_version() {
@@ -340,6 +307,25 @@ check_latest_version() {
 		# Failed to get tags (auth error, network issue, etc.)
 		echo "CHECK_FAILED"
 	fi
+}
+
+# Helper function to track scan errors consistently
+track_scan_error() {
+	local img="$1"
+	local err_msg="$2"
+	local package_json="${image_to_package[$img]}"
+	local pkg_name="unknown"
+	if [[ -n "$package_json" ]]; then
+		pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
+	fi
+	local error_obj
+	error_obj=$(jq -n \
+		--arg pkg "$pkg_name" \
+		--arg img "$img" \
+		--arg err "$err_msg" \
+		'{package: $pkg, image: $img, error: $err}')
+	scan_errors+=("$error_obj")
+	((error_count++))
 }
 
 # Discover packages from registry
@@ -734,22 +720,7 @@ scan_image() {
 	# Check if image has 'latest' tag (only for non-OCI directories)
 	if [[ "$is_oci_dir" == "false" && "$image" =~ :latest$ ]]; then
 		warning "  ⚠ WARNING: Image has 'latest' tag and will not be scanned"
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Image has 'latest' tag and was not scanned" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
-		# Errors are tracked in scan_errors array and saved to scan-results.json
+		track_scan_error "$image" "Image has 'latest' tag and was not scanned"
 		return 1
 	fi
 
@@ -802,23 +773,7 @@ scan_image() {
 	# Check if grype failed or if there are auth errors in the output
 	if [[ $grype_exit_code -ne 0 ]] || echo "$grype_output" | grep -q "401 UNAUTHORIZED\|UNAUTHORIZED: access to the requested resource is not authorized\|pull failed\|no host address"; then
 		error "Failed to scan image: $image (exit code: $grype_exit_code)"
-		# Errors are tracked in scan_errors array and saved to scan-results.json
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Scan failed with exit code $grype_exit_code" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
-		# Remove the empty/invalid JSON file if created
+		track_scan_error "$image" "Scan failed with exit code $grype_exit_code"
 		[[ -f "$safe_filename" ]] && rm -f "$safe_filename"
 		return 1
 	fi
@@ -826,22 +781,7 @@ scan_image() {
 	# Verify the JSON file was created and is valid
 	if [[ ! -f "$safe_filename" ]] || ! jq empty "$safe_filename" 2>/dev/null; then
 		error "Failed to create valid scan results for: $image"
-		# Errors are tracked in scan_errors array and saved to scan-results.json
-		# Track error with package info
-		local package_json="${image_to_package[$image]}"
-		local pkg_name="unknown"
-		if [[ -n "$package_json" ]]; then
-			pkg_name=$(echo "$package_json" | jq -r '.name // "unknown"')
-		fi
-		# Use jq to properly create JSON object
-		local error_obj
-		error_obj=$(jq -n \
-			--arg pkg "$pkg_name" \
-			--arg img "$image" \
-			--arg err "Failed to create valid scan results" \
-			'{package: $pkg, image: $img, error: $err}')
-		scan_errors+=("$error_obj")
-		((error_count++))
+		track_scan_error "$image" "Failed to create valid scan results"
 		[[ -f "$safe_filename" ]] && rm -f "$safe_filename"
 		return 1
 	fi
@@ -852,16 +792,12 @@ scan_image() {
 	return 0
 }
 
-# This function is no longer needed as scanning is done per package
-# Keeping it for compatibility if called elsewhere
-# shellcheck disable=SC2329
-scan_images() {
-	warning "scan_images function is deprecated - scanning is now done per package"
-}
-
 # Process scan results and create combined report
 process_scan_results() {
-	echo "Combining scan results into scan-results.json..."
+	local timestamp
+	timestamp=$(date +"%Y%m%d-%H%M%S")
+	local scan_results_file="scan-results-${timestamp}.json"
+	echo "Combining scan results into $scan_results_file..."
 
 	# Ensure global variables are available with safe defaults
 	local total_packages=0
@@ -926,7 +862,7 @@ process_scan_results() {
 	grype_version=$(grype --version 2>/dev/null | cut -d' ' -f2 || echo 'unknown')
 
 	# Start building the JSON structure
-	cat >scan-results.json <<EOF
+	cat >"$scan_results_file" <<EOF
 {
   "metadata": {
     "scanTimestamp": "$scan_timestamp",
@@ -961,8 +897,8 @@ EOF
 	# Process each JSON file and extract vulnerability counts
 	first=true
 	for json_file in *.json; do
-		# Skip the scan-results.json file itself and temporary files
-		[[ "$json_file" == "scan-results.json" ]] && continue
+		# Skip the scan-results files and temporary files
+		[[ "$json_file" == scan-results*.json ]] && continue
 		[[ "$json_file" == "all_vulnerabilities.json" ]] && continue
 
 		if [[ -f "$json_file" ]]; then
@@ -970,7 +906,7 @@ EOF
 			if [[ "$first" == "true" ]]; then
 				first=false
 			else
-				echo "," >>scan-results.json
+				echo "," >>"$scan_results_file"
 			fi
 
 			# Process the scan file (implementation continues as in original)
@@ -979,8 +915,8 @@ EOF
 	done
 
 	# Close the scan results array
-	echo "  ]" >>scan-results.json
-	echo "}" >>scan-results.json
+	echo "  ]" >>"$scan_results_file"
+	echo "}" >>"$scan_results_file"
 
 	# Calculate totals and update summary (implementation continues as in original)
 	finalize_scan_results
@@ -1151,13 +1087,13 @@ process_single_scan_result() {
 			echo "        \"totalRisk\": $total_risk"
 			echo "      }"
 			echo "    }"
-		} >>scan-results.json
+		} >>"$scan_results_file"
 	fi
 }
 
 # Finalize scan results with totals and package summaries
 finalize_scan_results() {
-	local scan_results_file="${1:-scan-results.json}"
+	# scan_results_file is already set at the beginning of this function
 
 	# Calculate the total counts from all collected severities
 	if [[ -f all_severities.txt ]]; then
@@ -1195,7 +1131,7 @@ finalize_scan_results() {
 	total_vulnerabilities=$((total_critical + total_high + total_medium + total_low + total_negligible + total_unknown))
 	total_unfixable=$((total_vulnerabilities - total_fixable))
 
-	# Update scan-results.json with final values
+	# Update scan results file with final values
 	update_final_scan_results
 }
 
@@ -1343,12 +1279,12 @@ update_final_scan_results() {
 	fi
 
 	# Use jq to update the summary values and replace the packages placeholder
-	if jq empty scan-results.json 2>/dev/null && jq empty packages_temp.json 2>/dev/null; then
+	if jq empty "$scan_results_file" 2>/dev/null && jq empty packages_temp.json 2>/dev/null; then
 		# Read packages array and update the entire summary
 		packages_array=$(cat packages_temp.json)
 
 		# Update the JSON file with all summary values including packages and errors
-		debug "Updating scan-results.json with packages array and errors"
+		debug "Updating $scan_results_file with packages array and errors"
 		if jq --argjson packages "$packages_array" \
 			--argjson errors "$errors_json" \
 			".summary.packages = \$packages |
@@ -1362,11 +1298,11 @@ update_final_scan_results() {
         .summary.totalVulnerabilities = $total_vulnerabilities |
         .summary.fixableVulnerabilities = $total_fixable |
         .summary.unfixableVulnerabilities = $total_unfixable |
-        .summary.totalRisk = $total_risk" scan-results.json >grype-results-temp.json; then
-			mv grype-results-temp.json scan-results.json
-			debug "Successfully updated scan-results.json with package information and errors"
+        .summary.totalRisk = $total_risk" "$scan_results_file" >grype-results-temp.json; then
+			mv grype-results-temp.json "$scan_results_file"
+			debug "Successfully updated $scan_results_file with package information and errors"
 		else
-			error "Failed to update scan-results.json with package information"
+			error "Failed to update $scan_results_file with package information"
 			debug "jq command failed - checking packages_array content"
 			debug "packages_array length: ${#packages_array}"
 		fi
@@ -1394,19 +1330,19 @@ create_output_archive() {
 	# Create tarball for all json files (excluding temporary files)
 	tarball_name="scan_results_$(date +%Y%m%d_%H%M%S).tar.gz"
 	# Use find to exclude temporary files
-	find . -maxdepth 1 -name "*.json" ! -name "all_vulnerabilities.json" ! -name "scan-results.json" -exec tar -czf "$tarball_name" {} +
+	find . -maxdepth 1 -name "*.json" ! -name "all_vulnerabilities.json" ! -name "scan-results*.json" -exec tar -czf "$tarball_name" {} +
 	echo "Scan results archived in $tarball_name" >&2
 
 	# Move the output files to the artifacts directory
 	# shellcheck disable=SC2154  # artifacts_dir is defined in common.sh
 	mv "$tarball_name" "${OUTPUT_DIR}/"
-	cp scan-results.json "${OUTPUT_DIR}/scan-results.json"
-	rm -f scan-results.json
+	cp "$scan_results_file" "${OUTPUT_DIR}/$scan_results_file"
+	rm -f "$scan_results_file"
 
 	# Clean up temporary _images.txt file
 	rm -f _images.txt
 
-	echo "Combined scan results saved to ${OUTPUT_DIR}/scan-results.json (includes package and image information)" >&2
+	echo "Combined scan results saved to ${OUTPUT_DIR}/$scan_results_file (includes package and image information)" >&2
 	echo "Scan results tarball saved to ${OUTPUT_DIR}/$tarball_name" >&2
 }
 
@@ -1438,11 +1374,8 @@ main() {
 	# Change to the working directory
 	cd "$working_dir" || exit 1
 
-	# Make packages and package_info arrays global
-	declare -ga packages
-	declare -ga package_info
-
 	# Process packages one at a time (pull, extract, scan, cleanup)
+	# Note: packages and package_info arrays are already declared as global in discover_packages
 	process_packages "$working_dir"
 
 	# Process scan results and create combined report
