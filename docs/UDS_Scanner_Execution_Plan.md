@@ -12,7 +12,6 @@ graph TB
         A[Command Line Args] --> B[Parse Arguments]
         C[versions.json] --> D[Package Discovery]
         E[Environment Variables] --> F[Credential Management]
-        G[OnePassword] --> F
     end
 
     subgraph "Initialization Phase"
@@ -69,7 +68,6 @@ graph TB
 OPTIONS:
   -h, --help              Show help message
   -d, --debug             Enable debug output
-  --skip-op               Skip OnePassword credential retrieval
   --skip-version-check    Skip checking for newer image versions
   --skip-validation       Skip package registry validation
   -o, --output DIR        Output directory (default: artifacts/)
@@ -133,7 +131,7 @@ declare -gA registry_has_credentials    # Registry authentication status
 
 ### Security Features
 
-- **Credential Management**: OnePassword integration with secure fallbacks
+- **Credential Management**: Environment variables with interactive fallbacks
 - **Registry Authentication**: Secure login using Zarf
 - **Package Validation**: Pre-flight verification of package existence
 - **Safe File Handling**: Secure filename generation and cleanup
@@ -158,24 +156,22 @@ flowchart TD
     D --> E
 
     E --> F[Create Output Directory]
-    F --> G{Skip OnePassword?}
+    F --> G[Check UDS Credentials]
 
     subgraph "Credential Management"
-        G -->|No| H[Check UDS Credentials]
-        H --> I{UDS Creds Available?}
-        I -->|No| J[Fetch from OnePassword]
-        I -->|Yes| K[Use Existing]
-        J --> L[Check Iron Bank Creds]
-        K --> L
+        G --> H{UDS Creds Available?}
+        H -->|No| I[Use Environment Variables]
+        H -->|Yes| J[Use Existing]
+        I --> K[Check Iron Bank Creds]
+        J --> K
 
-        L --> M{Iron Bank Creds Available?}
-        M -->|No| N[Fetch from OnePassword]
-        M -->|Yes| O[Use Existing]
-        N --> O
+        K --> L{Iron Bank Creds Available?}
+        L -->|No| M[Use Environment Variables]
+        L -->|Yes| N[Use Existing]
+        M --> N
     end
 
-    G -->|Yes| P[Prompt for Missing Credentials]
-    O --> P
+    N --> P[Prompt for Missing Credentials]
 
     P --> Q{Interactive Mode?}
     Q -->|Yes| R[Prompt User for Input]
@@ -200,19 +196,17 @@ flowchart TD
     style Y fill:#f44336,color:white
     style BB fill:#f44336,color:white
     style CC fill:#2196f3,color:white
-    style J fill:#ff9800,color:white
-    style N fill:#ff9800,color:white
 ```
 
 **Key Activities:**
 
 - Parse and validate command-line arguments
 - Initialize debug and output settings
-- Manage credentials through OnePassword or environment variables
+- Manage credentials through environment variables with interactive prompts as fallback
 - Authenticate with UDS and Iron Bank registries
 - Validate all prerequisites before proceeding
 
-**Dependencies:** OnePassword CLI (optional), Zarf, network connectivity
+**Dependencies:** Zarf, network connectivity
 
 ## Phase 2: Package Discovery & Validation
 
@@ -523,7 +517,6 @@ graph LR
     subgraph "Input Data"
         A[versions.json] --> B[Package Definitions]
         C[Environment Variables] --> D[Credentials]
-        E[OnePassword] --> D
         F[Command Args] --> G[Configuration]
     end
 
@@ -585,10 +578,10 @@ flowchart TD
     B -->|File System Error| G[File System Error]
 
     subgraph "Credential Error Handling"
-        C --> C1{OnePassword Available?}
-        C1 -->|Yes| C2[Retry with OnePassword]
+        C --> C1{Environment Vars Available?}
+        C1 -->|Yes| C2[Use Environment Variables]
         C1 -->|No| C3[Prompt User Input]
-        C2 --> C4{Retry Success?}
+        C2 --> C4{Credentials Valid?}
         C3 --> C4
         C4 -->|Yes| C5[Continue Processing]
         C4 -->|No| C6[Exit with Error]
@@ -659,7 +652,6 @@ flowchart TD
 - **Zarf**: Package operations and registry authentication
 - **Grype**: Vulnerability scanning engine
 - **jq**: JSON processing and manipulation
-- **OnePassword CLI**: Optional credential management
 
 ### System Requirements
 
@@ -671,13 +663,13 @@ flowchart TD
 ### Configuration Requirements
 
 - Valid `versions.json` with package definitions
-- Registry credentials (OnePassword, environment variables, or interactive)
+- Registry credentials (environment variables or interactive prompts)
 - Appropriate architecture selection (amd64/arm64)
 
 ## Key Technical Strengths
 
 1. **Robust Error Handling**: Package-level failures don't stop entire scans
-1. **Security-First Design**: Secure credential management with multiple fallback options
+1. **Security-First Design**: Secure credential management with environment variables and interactive prompts
 1. **Performance Optimized**: Sequential processing with immediate cleanup to minimize resource usage
 1. **Enterprise Ready**: Support for multiple registries, architectures, and FIPS compliance
 1. **Comprehensive Reporting**: Detailed vulnerability attribution back to specific packages and environments
@@ -694,7 +686,7 @@ flowchart TD
 ### Automated Non-Interactive Scan
 
 ```bash
-./bin/scan.sh -y --skip-op --output /tmp/scan-results
+./bin/scan.sh -y --output /tmp/scan-results
 ```
 
 ### Debug Mode with Custom Architecture

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(shellcheck:*)",
+      "Bash(bash:*)",
+      "Bash(./bin/scan.sh:*)"
+    ]
+  },
+  "enableAllProjectMcpServers": false
+}
