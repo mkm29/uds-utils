@@ -7,7 +7,6 @@ source "$(dirname "$(realpath "$0")")/common.sh"
 
 # Global variables
 DEBUG=0
-SKIP_ONEPASSWORD=0
 SKIP_VERSION_CHECK=0
 SKIP_VALIDATION=0 # Skip package validation
 INTERACTIVE=1     # Default to interactive mode
@@ -29,7 +28,6 @@ Scan container images from UDS packages for vulnerabilities using Grype.
 OPTIONS:
     -h, --help              Show this help message
     -d, --debug             Enable debug output
-    --skip-op               Skip OnePassword credential retrieval
     --skip-version-check    Skip checking for newer image versions
     --skip-validation       Skip validation that packages exist in registry
     -o, --output DIR        Output directory (default: artifacts/)
@@ -51,7 +49,7 @@ ENVIRONMENT VARIABLES:
 EXAMPLES:
     $(basename "$0")                                          # Run with default settings (interactive)
     $(basename "$0") --debug                                  # Run with debug output
-    $(basename "$0") --skip-op                                # Skip OnePassword, use env vars or prompts
+    $(basename "$0") --output /custom/path                    # Use custom output directory
     $(basename "$0") --exclude-tags "(sha256|nightly|rc)"     # Custom tag exclusion pattern
     $(basename "$0") --arch arm64                             # Scan for arm64 architecture
     $(basename "$0") -y                                       # Auto-approve all packages
@@ -70,9 +68,6 @@ parse_args() {
 		-d | --debug)
 			DEBUG=1
 			export DEBUG
-			;;
-		--skip-op)
-			SKIP_ONEPASSWORD=1
 			;;
 		--skip-version-check)
 			SKIP_VERSION_CHECK=1
@@ -116,28 +111,20 @@ parse_args() {
 	fi
 }
 
-# Initialize credentials from OnePassword or environment
+# Initialize credentials from environment variables
 initialize_credentials() {
-	# Get UDS credentials
-	if [[ $SKIP_ONEPASSWORD -eq 0 ]] && { [ -z "$UDS_USERNAME" ] || [ -z "$UDS_PASSWORD" ]; }; then
-		warning "Using OnePassword to fetch UDS registry credentials..."
-		UDS_USERNAME=$(op read "op://Delivery-Space-Engineers/uds-registry-sld45-pull-token/username")
-		export UDS_USERNAME
-		UDS_PASSWORD=$(op read "op://Delivery-Space-Engineers/uds-registry-sld45-pull-token/password")
-		export UDS_PASSWORD
+	# Check if UDS credentials are available in environment
+	if [[ -n "$UDS_USERNAME" && -n "$UDS_PASSWORD" ]]; then
+		info "Using UDS registry credentials from environment variables."
 	else
-		info "Using existing UDS registry credentials."
+		debug "UDS credentials not found in environment variables."
 	fi
 
-	# Get Iron Bank credentials
-	if [[ $SKIP_ONEPASSWORD -eq 0 ]] && { [ -z "$IRONBANK_USERNAME" ] || [ -z "$IRONBANK_PASSWORD" ]; }; then
-		warning "Using OnePassword to fetch Iron Bank credentials..."
-		IRONBANK_USERNAME=$(op read "op://Iron Bank/kgzc6aovgdj5bi5mmboxxrbi3e/username")
-		export IRONBANK_USERNAME
-		IRONBANK_PASSWORD=$(op read "op://Iron Bank/kgzc6aovgdj5bi5mmboxxrbi3e/password")
-		export IRONBANK_PASSWORD
+	# Check if Iron Bank credentials are available in environment
+	if [[ -n "$IRONBANK_USERNAME" && -n "$IRONBANK_PASSWORD" ]]; then
+		info "Using Iron Bank credentials from environment variables."
 	else
-		info "Using existing Iron Bank credentials."
+		debug "Iron Bank credentials not found in environment variables."
 	fi
 	echo >&2
 }
