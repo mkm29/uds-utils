@@ -51,11 +51,11 @@ graph TB
     end
 
     style A fill:#800080,stroke:#ffffff,stroke-width:2px
-    style C fill:#00FF00,stroke:#A9A9A9,stroke-width:2px
+    style C fill:#00FF00,stroke:#000000,stroke-width:2px
     style H fill:#FFA500,stroke:#ffffff,stroke-width:2px
-    style L fill:#e1f5fe,stroke:#A9A9A9,stroke-width:2px
+    style L fill:#e1f5fe,stroke:#000000,stroke-width:2px
     style O fill:#FF0000,stroke:#ffffff,stroke-width:2px
-    style S fill:#e8f5e8,stroke:#A9A9A9,stroke-width:2px
+    style S fill:#e8f5e8,stroke:#000000,stroke-width:2px
 ```
 
 ## API Interface Analysis
