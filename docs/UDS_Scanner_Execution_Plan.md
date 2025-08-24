@@ -50,12 +50,12 @@ graph TB
         X[Registry APIs] --> P
     end
 
-    style A fill:#e1f5fe,stroke:#0277bd,stroke-width:2px
-    style C fill:#e1f5fe,stroke:#0277bd,stroke-width:2px
-    style H fill:#fff3e0,stroke:#f57c00,stroke-width:2px
-    style L fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
-    style O fill:#ffebee,stroke:#c62828,stroke-width:2px
-    style S fill:#e8f5e8,stroke:#2e7d32,stroke-width:2px
+    style A fill:#800080,stroke:#ffffff,stroke-width:2px
+    style C fill:#00FF00,stroke:#A9A9A9,stroke-width:2px
+    style H fill:#FFA500,stroke:#ffffff,stroke-width:2px
+    style L fill:#e1f5fe,stroke:#A9A9A9,stroke-width:2px
+    style O fill:#FF0000,stroke:#ffffff,stroke-width:2px
+    style S fill:#e8f5e8,stroke:#A9A9A9,stroke-width:2px
 ```
 
 ## API Interface Analysis
