@@ -120,10 +120,6 @@ export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.m
 
 # Option 2: Let the script prompt you for missing values
 ./bin/scan.sh
-
-# Option 3: Use OnePassword (default behavior if credentials not set)
-# The script will automatically fetch credentials from OnePassword
-# Use --skip-op to disable this behavior
 ```
 
 #### Basic Usage
@@ -134,9 +130,6 @@ export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.m
 
 # Run with debug output
 ./bin/scan.sh --debug
-
-# Skip OnePassword credential retrieval (use env vars or prompts)
-./bin/scan.sh --skip-op
 
 # Skip version checking for faster scans
 ./bin/scan.sh --skip-version-check
@@ -158,7 +151,6 @@ export IRONBANK_URL="registry1.dso.mil"  # Optional, defaults to registry1.dso.m
 
 - `-h, --help` - Show help message and usage information
 - `-d, --debug` - Enable debug output for troubleshooting
-- `--skip-op` - Skip OnePassword credential retrieval (useful in CI/CD environments)
 - `--skip-version-check` - Skip checking for newer image versions (speeds up scanning)
 - `-o, --output DIR` - Specify output directory (default: `artifacts/`)
 - `--exclude-tags PATTERN` - Regex pattern for tags to exclude from version checking (default: `"(sha256|nightly|arm64|latest)"`)
@@ -308,7 +300,6 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - ✅ Architecture support with --arch flag (default: amd64)
 - ✅ Color-coded terminal output for better readability
 - ✅ Command-line options for flexible usage
-- ✅ OnePassword integration for secure credential management
 - ✅ Support for multiple registries (UDS and Iron Bank)
 - ✅ Debug mode for troubleshooting
 - ✅ Configurable output directory
@@ -353,7 +344,6 @@ OUTPUT_MODE=packages ./bin/get_tags.sh
 - bc - For floating point calculations
 - curl - For registry API calls
 - tar - For extracting package archives
-- OnePassword CLI (optional) - For secure credential management
 - Valid credentials for accessing OCI registries (UDS and Iron Bank)
 
 ### For letscerts.sh
