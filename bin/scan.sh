@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -uo pipefail # Remove -e to prevent early exit
+set -euo pipefail
 
 # Get script directory and project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +11,9 @@ REGISTRY="${REGISTRY:-registry.defenseunicorns.com}"
 ORG="${ORG:-sld-45}"
 ARCH="${ARCH:-amd64}"
 PACKAGES_FILE="${1:-${PROJECT_ROOT}/packages.txt}"
+
+# create associative array for processed packages
+declare -A PROCESSED_PACKAGES
 
 # Colors for output
 RED='\033[0;31m'
@@ -31,52 +34,60 @@ log_error() {
 	echo -e "${RED}[ERROR]${NC} $1"
 }
 
-log_debug() {
-	echo -e "${YELLOW}[DEBUG]${NC} $1"
-}
-
 # Function to clean up SBOM filename - remove registry and org prefixes
 clean_sbom_filename() {
 	local filename="$1"
-	# Remove .json extension first
+	# Remove .json extension first (SBOMs are still JSON)
 	local base="${filename%.json}"
 
-	# Remove common registry prefixes (handles dots converted to underscores)
+	# Split by underscore and look for common registry patterns to remove
+	# Common patterns: quay.io_, docker.io_, ghcr.io_, registry.*, etc.
+	# This regex removes everything up to and including the first registry-like pattern
 	local cleaned="$base"
+
+	# Remove common registry prefixes (handles dots converted to underscores)
 	cleaned=$(echo "$cleaned" | sed -E 's/^(quay_io_|docker_io_|ghcr_io_|registry[^_]*_|gcr_io_)//g')
 
 	# Remove organization/namespace that typically follows the registry
+	# This removes the first segment after registry removal if it looks like an org
+	# (e.g., rfcurated_, defenseunicorns_, etc.)
 	cleaned=$(echo "$cleaned" | sed -E 's/^[a-z0-9]+_//g')
 
-	# Return with .json extension
-	echo "${cleaned}.json"
+	# Return with .csv extension for the report
+	echo "${cleaned}.csv"
 }
 
-# Check that prereqs are installed
-for cmd in uds grype jq; do
+# check that prereqs are installed
+for cmd in uds jq grype; do
 	if ! command -v "$cmd" &>/dev/null; then
 		log_error "$cmd could not be found, please install $cmd to proceed."
 		exit 1
 	fi
 done
 
-# Create a temporary directory for processing
+# create a temporary directory for processing
 log_info "Creating temporary working directory..."
 WORK_DIR=$(mktemp -d)
 log_info "Working directory created at $WORK_DIR"
 mkdir -p "${WORK_DIR}/reports"
 mkdir -p "${WORK_DIR}/temp_reports"
 
-# Create a trap to clean up the temporary directory on exit
-trap 'rm -rf "$WORK_DIR"' EXIT
+# Create the Grype template file
+cat >"${WORK_DIR}/csv.tmpl" <<'EOF'
+{{- range .Matches -}}
+"{{.Artifact.Name}}","{{.Artifact.Version}}","{{if .Vulnerability.Fix.Versions}}{{index .Vulnerability.Fix.Versions 0}}{{end}}","{{.Artifact.Type}}","{{.Vulnerability.ID}}","{{.Vulnerability.Severity}}"
+{{ end -}}
+EOF
 
-# Read packages file
+# create a trap to clean up the temporary directory on exit
+trap 'rm -rf "$WORK_DIR"' EXIT
+cd "$WORK_DIR" || exit 1
+
 log_info "Reading packages from ${PACKAGES_FILE}..."
 if [ ! -f "$PACKAGES_FILE" ]; then
 	log_error "Packages file not found: $PACKAGES_FILE"
 	exit 1
 fi
-
 mapfile -t PACKAGES <"$PACKAGES_FILE"
 if [ ${#PACKAGES[@]} -eq 0 ]; then
 	log_error "No packages found in $PACKAGES_FILE"
@@ -84,183 +95,154 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
 fi
 log_info "Found ${#PACKAGES[@]} packages to scan."
 
-# Track statistics
-total_sboms_scanned=0
-total_reports_created=0
-failed_packages=0
-successful_packages=0
-
-# Process each package
+# create directory for each package
 for pkg in "${PACKAGES[@]}"; do
-	log_info "Processing package: $pkg"
-
-	# Create directory for this package's SBOMs
 	pkg_dir="${WORK_DIR}/$(echo "$pkg" | tr '/:' '__')"
 	mkdir -p "$pkg_dir"
+	PROCESSED_PACKAGES["$pkg"]=0
+done
 
-	# Download SBOMs for the package
-	log_debug "  Running: uds zarf package inspect sbom \"oci://${REGISTRY}/${ORG}/${pkg}\" -a \"${ARCH}\" --output \"${pkg_dir}\""
+# download SBOMS for each package
+# example: zarf package inspect sbom oci://registry.defenseunicorns.com/sld-45/gitlab-runner:18.3.0-uds.0-registry1 -a amd64
+for pkg in "${PACKAGES[@]}"; do
+	log_info "Processing package: $pkg"
+	pkg_dir="${WORK_DIR}/$(echo "$pkg" | tr '/:' '__')"
 
-	if ! uds zarf package inspect sbom "oci://${REGISTRY}/${ORG}/${pkg}" -a "${ARCH}" --output "${pkg_dir}"; then
-		log_warn "  Failed to pull SBOMs for: $pkg. Skipping..."
-		((failed_packages++))
+	if ! uds zarf package inspect sbom "oci://${REGISTRY}/${ORG}/${pkg}" -a "${ARCH}" --output "${pkg_dir}" &>/dev/null; then
+		log_warn "Failed to pull package SBOMs: $pkg. Skipping..."
 		continue
 	fi
 
-	# Check if any JSON files were actually created
-	json_count=$(find "${pkg_dir}" -type f -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
-	log_debug "  Found $json_count SBOM JSON files in ${pkg_dir}"
-
-	if [ "$json_count" -eq 0 ]; then
-		log_warn "  No SBOM JSON files found for $pkg"
-		((failed_packages++))
-		continue
-	fi
-
-	# Create safe package name for report naming
+	# Create safe package name for the merged report
 	pkg_safe=$(echo "$pkg" | tr '/:' '_')
 
 	# Create temporary directory for this package's individual reports
 	pkg_temp_dir="${WORK_DIR}/temp_reports/${pkg_safe}"
 	mkdir -p "$pkg_temp_dir"
 
-	# Reset array for this package
-	unset report_files
-	declare -a report_files=()
+	# Array to hold all CSV files for this package
+	declare -a csv_files=()
 
-	# Scan each SBOM JSON file found
-	sbom_count=0
+	# iterate over all JSON files in $pkg_dir and scan each with grype
+	# Use find to locate all JSON files recursively
 	while IFS= read -r -d '' sbom; do
 		# Get the original filename
 		original_filename=$(basename "${sbom}")
 
-		# Clean the filename to create report name
+		# Clean the filename to remove registry/org prefixes and change extension to .csv
 		cleaned_filename=$(clean_sbom_filename "$original_filename")
-
-		# Create report name for individual SBOM
-		temp_report_path="${pkg_temp_dir}/${cleaned_filename}"
 
 		log_info "  Scanning SBOM: ${original_filename}"
 
-		# Run Grype scan and save as JSON (allow it to fail)
-		if grype sbom:"${sbom}" -o json --file "$temp_report_path" 2>/dev/null; then
-			log_debug "    Grype completed successfully"
-		else
-			log_debug "    Grype found vulnerabilities or encountered an error"
+		# Save individual report to temp directory as CSV
+		temp_report="${pkg_temp_dir}/${cleaned_filename}"
+		grype sbom:"${sbom}" -o template -t "${WORK_DIR}/csv.tmpl" --file "$temp_report"
+
+		# Add to array if file was created successfully and is not empty
+		if [ -f "$temp_report" ] && [ -s "$temp_report" ]; then
+			csv_files+=("$temp_report")
 		fi
 
-		# Check if report was created
-		if [ -f "$temp_report_path" ]; then
-			log_info "    Created temp report: ${cleaned_filename}"
-			report_files+=("$temp_report_path")
-			((sbom_count++))
-		else
-			log_warn "    Failed to create report for: ${original_filename}"
-		fi
-
-		((total_sboms_scanned++))
+		PROCESSED_PACKAGES["$pkg"]=1
 	done < <(find "${pkg_dir}" -type f -name "*.json" -print0)
 
-	# Merge all reports for this package
-	if [ ${#report_files[@]} -gt 0 ]; then
-		merged_report="${WORK_DIR}/reports/${pkg_safe}.json"
+	# Merge all CSV reports for this package into a single file
+	if [ ${#csv_files[@]} -gt 0 ]; then
+		merged_report="${WORK_DIR}/reports/${pkg_safe}.csv"
 
-		if [ ${#report_files[@]} -eq 1 ]; then
-			# Only one report, just copy it
-			log_info "  Single SBOM found, copying report..."
-			cp "${report_files[0]}" "$merged_report"
-		else
-			# Multiple reports - merge them using jq
-			log_info "  Merging ${#report_files[@]} SBOM reports for $pkg..."
+		log_info "  Merging ${#csv_files[@]} SBOM report(s) into: ${pkg_safe}.csv"
 
-			# Merge all matches arrays and preserve other metadata from the first report
-			if jq -s '
-				# Take the first report as the base
-				.[0] as $base |
-				# Collect all matches from all reports
-				[.[] | .matches // []] | flatten as $all_matches |
-				# Merge into base structure, replacing matches with combined array
-				$base | .matches = $all_matches
-			' "${report_files[@]}" >"$merged_report" 2>/dev/null; then
-				# Count total vulnerabilities in merged report
-				vuln_count=$(jq '.matches | length' "$merged_report" 2>/dev/null || echo "0")
-				log_info "  Merged report contains $vuln_count total vulnerabilities"
-			else
-				log_error "  Failed to merge reports with jq"
+		# Create CSV header
+		echo '"Package","Version","Fixed Version","Type","CVE ID","Severity"' >"$merged_report"
+
+		# Concatenate all CSV files (they don't have headers due to the template)
+		for csv_file in "${csv_files[@]}"; do
+			if [ -s "$csv_file" ]; then # Only append if file is not empty
+				cat "$csv_file" >>"$merged_report"
 			fi
-		fi
+		done
 
+		# Remove duplicate lines if any (keeping the header)
+		temp_dedup="${merged_report}.tmp"
+		head -n 1 "$merged_report" >"$temp_dedup"
+		tail -n +2 "$merged_report" | sort -u >>"$temp_dedup"
+		mv "$temp_dedup" "$merged_report"
+
+		# Verify the merged file was created
 		if [ -f "$merged_report" ]; then
-			log_info "  Successfully created merged report: ${pkg_safe}.json"
-			((total_reports_created++))
-			((successful_packages++))
+			# Count vulnerabilities (minus the header line)
+			vuln_count=$(($(wc -l <"$merged_report") - 1))
+			log_info "  Successfully created merged report: $(basename "$merged_report")"
+			log_info "  Total unique vulnerabilities found: $vuln_count"
 		else
 			log_error "  Failed to create merged report for $pkg"
 		fi
 
-		# Clean up temporary reports
+		# Clean up temporary reports for this package
 		rm -rf "$pkg_temp_dir"
 	else
-		log_warn "  No SBOMs successfully scanned for $pkg"
-	fi
+		log_warn "  No vulnerabilities found in SBOMs for $pkg"
 
-	log_info "  Finished processing $pkg"
-	log_info ""
+		# Create an empty CSV with just headers for packages with no vulnerabilities
+		merged_report="${WORK_DIR}/reports/${pkg_safe}.csv"
+		echo '"Package","Version","Fixed Version","Type","CVE ID","Severity"' >"$merged_report"
+		echo "No vulnerabilities found" >>"$merged_report"
+	fi
 done
 
 # Clean up all temporary directories
 rm -rf "${WORK_DIR}/temp_reports"
 
 # Check if any reports were created
-if [ $total_reports_created -eq 0 ]; then
+if [ -z "$(ls -A "${WORK_DIR}/reports" 2>/dev/null)" ]; then
 	log_error "No reports were generated."
 	exit 1
 fi
 
-# Optional: Create a master JSON report with all vulnerabilities from all packages
+# Optional: Create a master CSV with all vulnerabilities from all packages
 log_info "Creating master vulnerability report..."
-master_report="${WORK_DIR}/reports/ALL_VULNERABILITIES.json"
+master_report="${WORK_DIR}/reports/ALL_VULNERABILITIES.csv"
+echo '"Package","Version","Fixed Version","Type","CVE ID","Severity"' >"$master_report"
 
-# Collect all package reports
-all_reports=()
-for report in "${WORK_DIR}/reports"/*.json; do
+for report in "${WORK_DIR}/reports"/*.csv; do
 	if [ "$report" != "$master_report" ] && [ -f "$report" ]; then
-		all_reports+=("$report")
+		# Skip header line and any "No vulnerabilities found" messages
+		tail -n +2 "$report" | grep -v "No vulnerabilities found" >>"$master_report" 2>/dev/null || true
 	fi
 done
 
-if [ ${#all_reports[@]} -gt 0 ]; then
-	# Merge all package reports into one master report
-	if jq -s '
-		# Take metadata from first report
-		.[0] as $base |
-		# Collect all matches from all reports
-		[.[] | .matches // []] | flatten as $all_matches |
-		# Create master report with combined matches
-		$base | .matches = $all_matches
-	' "${all_reports[@]}" >"$master_report" 2>/dev/null; then
-		total_vulns=$(jq '.matches | length' "$master_report" 2>/dev/null || echo "0")
-		log_info "Master report contains $total_vulns total vulnerabilities across all packages"
-	else
-		log_warn "Failed to create master report"
-	fi
-fi
+# Remove duplicates from master report
+temp_master="${master_report}.tmp"
+head -n 1 "$master_report" >"$temp_master"
+tail -n +2 "$master_report" | sort -u >>"$temp_master"
+mv "$temp_master" "$master_report"
 
-# Create tarball of all reports
-log_info ""
-log_info "Creating tarball of all Grype reports..."
+total_vulns=$(($(wc -l <"$master_report") - 1))
+log_info "Total unique vulnerabilities across all packages: $total_vulns"
+
+log_info "Create tarball of all Grype reports..."
 tar czf "${PROJECT_ROOT}/zarf-scan-reports.tar.gz" -C "${WORK_DIR}" reports/
 log_info "Reports tarball created at ${PROJECT_ROOT}/zarf-scan-reports.tar.gz"
 
-# Print summary
+# summarize results
 log_info ""
 log_info "========== Summary =========="
-log_info "Total packages: ${#PACKAGES[@]}"
-log_info "Successful packages: $successful_packages"
-log_info "Failed packages: $failed_packages"
-log_info "Total SBOMs found: $total_sboms_scanned"
-log_info "Total package reports created: $total_reports_created"
+successful_count=0
+failed_count=0
+
+for pkg in "${!PROCESSED_PACKAGES[@]}"; do
+	if [ "${PROCESSED_PACKAGES[$pkg]}" -eq 1 ]; then
+		log_info "  ✓ $pkg: Processed"
+		((successful_count++))
+	else
+		log_warn "  ✗ $pkg: Failed/Skipped"
+		((failed_count++))
+	fi
+done
+
 log_info ""
+log_info "Total: $successful_count successful, $failed_count failed/skipped"
+log_info "Total unique vulnerabilities found: $total_vulns"
 log_info "Output: ${PROJECT_ROOT}/zarf-scan-reports.tar.gz"
 
 exit 0
