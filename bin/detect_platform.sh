@@ -4,62 +4,62 @@
 
 # Get operating system
 get_os() {
-    local os
-    os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    
-    case "$os" in
-        linux)   echo "linux" ;;
-        darwin)  echo "darwin" ;;    # macOS
-        mingw*|msys*|cygwin*) echo "windows" ;;
-        *)       echo "$os" ;;
-    esac
+	local os
+	os=$(uname -s | tr '[:upper:]' '[:lower:]')
+
+	case "$os" in
+	linux) echo "linux" ;;
+	darwin) echo "darwin" ;; # macOS
+	mingw* | msys* | cygwin*) echo "windows" ;;
+	*) echo "$os" ;;
+	esac
 }
 
 # Get CPU architecture
 get_arch() {
-    local arch
-    arch=$(uname -m)
-    
-    case "$arch" in
-        x86_64|amd64)    echo "amd64" ;;     # Intel/AMD 64-bit
-        aarch64|arm64)   echo "arm64" ;;     # ARM 64-bit
-        armv7l|armv7)    echo "arm" ;;       # ARM 32-bit
-        i386|i686)       echo "386" ;;       # Intel/AMD 32-bit
-        *)               echo "$arch" ;;
-    esac
+	local arch
+	arch=$(uname -m)
+
+	case "$arch" in
+	x86_64 | amd64) echo "amd64" ;;  # Intel/AMD 64-bit
+	aarch64 | arm64) echo "arm64" ;; # ARM 64-bit
+	armv7l | armv7) echo "arm" ;;    # ARM 32-bit
+	i386 | i686) echo "386" ;;       # Intel/AMD 32-bit
+	*) echo "$arch" ;;
+	esac
 }
 
 # Get combined platform string
 get_platform() {
-    echo "$(get_os)-$(get_arch)"
+	echo "$(get_os)-$(get_arch)"
 }
 
 # Main
 case "${1:-}" in
-    os|--os)
-        get_os
-        ;;
-    arch|--arch)
-        get_arch
-        ;;
-    -s|--separate)
-        echo "OS: $(get_os)"
-        echo "Architecture: $(get_arch)"
-        ;;
-    -d|--detailed)
-        os_raw=$(uname -s)
-        arch_raw=$(uname -m)
-        os=$(get_os)
-        arch=$(get_arch)
-        
-        echo "Raw OS: $os_raw"
-        echo "Raw Architecture: $arch_raw"
-        echo "Normalized OS: $os"
-        echo "Normalized Architecture: $arch"
-        echo "Platform String: ${os}-${arch}"
-        ;;
-    -h|--help)
-        cat <<EOF
+os | --os)
+	get_os
+	;;
+arch | --arch)
+	get_arch
+	;;
+-s | --separate)
+	echo "OS: $(get_os)"
+	echo "Architecture: $(get_arch)"
+	;;
+-d | --detailed)
+	os_raw=$(uname -s)
+	arch_raw=$(uname -m)
+	os=$(get_os)
+	arch=$(get_arch)
+
+	echo "Raw OS: $os_raw"
+	echo "Raw Architecture: $arch_raw"
+	echo "Normalized OS: $os"
+	echo "Normalized Architecture: $arch"
+	echo "Platform String: ${os}-${arch}"
+	;;
+-h | --help)
+	cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
 Detect operating system and CPU architecture.
@@ -87,10 +87,10 @@ Common platforms:
   darwin-arm64   - macOS on Apple Silicon (M1/M2/M3)
   windows-amd64  - Windows on Intel/AMD 64-bit
 EOF
-        ;;
-    *)
-        get_platform
-        ;;
+	;;
+*)
+	get_platform
+	;;
 esac
 
 export -f get_os
