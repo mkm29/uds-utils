@@ -14,14 +14,14 @@
 #   help    Show help message
 #
 # Author: Mitchell Murphy
-# Date: 2025-01-28
-# Version: 1.1.1
+# Date: 2025-01-29
+# Version: 1.2.2
 
-# Default values
-DEFAULT_CLUSTER_NAME="uds-eks-dev-uds"
+# Default values (empty means auto-discover)
+DEFAULT_CLUSTER_NAME=""  # Will be auto-discovered from AWS
 DEFAULT_REGION="us-gov-east-1"
 DEFAULT_FILTER_VALUE="*bastion*"
-DEFAULT_PROFILE="jam-dev"
+DEFAULT_PROFILE="${AWS_PROFILE:-}"  # Use AWS_PROFILE from environment if set
 
 # State directory for persistent session tracking
 STATE_DIR="$HOME/.local/state/udsm"
@@ -63,14 +63,18 @@ show_start_usage() {
 	echo "Start an SSM port forwarding session to forward EKS cluster endpoint to localhost."
 	echo ""
 	echo "Options:"
-	echo "  -C, --cluster-name    EKS cluster name (default: $DEFAULT_CLUSTER_NAME)"
+	echo "  -C, --cluster-name    EKS cluster name (default: auto-discover first cluster)"
 	echo "  -R, --region          AWS region (default: $DEFAULT_REGION)"
 	echo "  -F, --filter          EC2 instance name filter (default: $DEFAULT_FILTER_VALUE)"
 	echo "  -I, --instance-id     EC2 instance ID (overrides filter lookup)"
 	echo "  -E, --endpoint        EKS cluster endpoint (overrides cluster lookup)"
-	echo "  -P, --profile         AWS profile to use (default: $DEFAULT_PROFILE)"
-	echo "  -N, --no-uds          Disable UDS mode (don't forward Istio gateway ports, only forward EKS endpoint)"
+	echo "  -P, --profile         AWS profile (default: \$AWS_PROFILE from environment)"
+	echo "  -N, --no-uds          Disable UDS mode (don't forward Istio gateway ports)"
+	echo "  -y, --yes             Skip confirmation prompt"
 	echo "  -H, --help            Show this help message"
+	echo ""
+	echo "The script will auto-discover the EKS cluster and use AWS_PROFILE from your"
+	echo "environment if not explicitly specified. Use 'assume <profile>' to set AWS_PROFILE."
 }
 
 # Function to display ssh command usage
@@ -120,11 +124,38 @@ find_instance() {
 	local filter_value="$1"
 	local region="$2"
 	local profile="$3"
-	
+
 	AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
 		--filters "Name=tag:Name,Values=${filter_value}" \
 		--query "Reservations[0].Instances[0].InstanceId" \
 		--output text | head -n1
+}
+
+# Function to discover the first EKS cluster
+discover_eks_cluster() {
+	local region="$1"
+	local profile="$2"
+
+	local clusters
+	clusters=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks list-clusters \
+		--query "clusters[0]" \
+		--output text 2>/dev/null)
+
+	if [ -z "$clusters" ] || [ "$clusters" = "None" ] || [ "$clusters" = "null" ]; then
+		return 1
+	fi
+
+	echo "$clusters"
+}
+
+# Function to list all EKS clusters (for display)
+list_eks_clusters() {
+	local region="$1"
+	local profile="$2"
+
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws eks list-clusters \
+		--query "clusters[]" \
+		--output text 2>/dev/null
 }
 
 # Common AWS environment setup
@@ -250,6 +281,18 @@ create_kubeconfig() {
 	local kubeconfig_file="$temp_dir/kubeconfig"
 
 	echo "Creating kubeconfig file..." >&2
+
+	# NOTE: We intentionally do NOT embed AWS credentials in the kubeconfig.
+	#
+	# When using granted/assume, credentials are short-lived STS tokens that expire
+	# (typically after 1 hour). If we embed them, kubectl will fail once they expire.
+	#
+	# Instead, we let `aws eks get-token` use the default AWS credential chain,
+	# which will pick up credentials from the user's current environment.
+	#
+	# This means users must ensure they have valid AWS credentials (via granted,
+	# profiles, or other means) when running kubectl commands.
+
 	cat > "$kubeconfig_file" <<EOF
 apiVersion: v1
 clusters:
@@ -280,11 +323,8 @@ users:
       - --output
       - json
       command: aws
-      env:
-      - name: AWS_PROFILE
-        value: $profile
 EOF
-	
+
 	echo "$kubeconfig_file"
 }
 
@@ -362,12 +402,13 @@ cleanup_session() {
 parse_start_args() {
 	# First parse common args
 	eval "$(parse_common_args "$@")"
-	
+
 	# Start-specific defaults
 	local cluster_name="$DEFAULT_CLUSTER_NAME"
 	local endpoint=""
 	local uds_mode=true
-	
+	local skip_confirm=false
+
 	# Re-parse for start-specific options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
@@ -383,6 +424,10 @@ parse_start_args() {
 				uds_mode=false
 				shift
 				;;
+			--yes|-y)
+				skip_confirm=true
+				shift
+				;;
 			--region|-R|--profile|-P|--instance-id|-I|--filter|-F|--help|-H)
 				# Already handled by parse_common_args
 				shift
@@ -393,7 +438,7 @@ parse_start_args() {
 				;;
 		esac
 	done
-	
+
 	# Output all variables
 	cat <<EOF
 region="$region"
@@ -404,6 +449,7 @@ help_requested=$help_requested
 cluster_name="$cluster_name"
 endpoint="$endpoint"
 uds_mode=$uds_mode
+skip_confirm=$skip_confirm
 EOF
 }
 
@@ -649,58 +695,96 @@ stop_istio_forwarding() {
 cmd_start() {
 	# Parse arguments
 	eval "$(parse_start_args "$@")"
-	
+
 	# Handle help
 	if [ "$help_requested" = "true" ]; then
 		show_start_usage
 		exit 0
 	fi
-	
+
+	# Check if profile is set
+	if [ -z "$profile" ]; then
+		echo "Error: No AWS profile specified." >&2
+		echo "" >&2
+		echo "Either:" >&2
+		echo "  1. Set AWS_PROFILE environment variable (e.g., using 'assume <profile>')" >&2
+		echo "  2. Use the -P/--profile option" >&2
+		exit 1
+	fi
+
 	# Setup AWS environment
 	setup_aws_env "$region" "$profile"
-	
-	print_logo >&2
-	echo >&2
-	echo "Starting SSM port forwarding session..." >&2
-	echo "Cluster Name: $cluster_name" >&2
-	echo "Region: $region" >&2
-	echo "AWS Profile: $profile" >&2
-	if [ "$uds_mode" = "false" ]; then
-		echo "UDS Mode: Disabled (EKS endpoint only)" >&2
-	else
-		echo "UDS Mode: Enabled (Istio gateway forwarding + hostctl domains)" >&2
-	fi
-	echo >&2
-	
+
 	# Preflight checks
 	preflight "start"
-	
-	# Check hostctl if in UDS mode
-	if [ "$uds_mode" = "true" ]; then
-		check_hostctl
+
+	# Auto-discover cluster if not provided
+	if [ -z "$cluster_name" ]; then
+		echo "Discovering EKS clusters..." >&2
+		cluster_name=$(discover_eks_cluster "$region" "$profile")
+		if [ -z "$cluster_name" ]; then
+			echo "Error: No EKS clusters found in region $region with profile $profile" >&2
+			echo "" >&2
+			echo "Available clusters:" >&2
+			list_eks_clusters "$region" "$profile" >&2 || echo "  (none found)" >&2
+			exit 1
+		fi
+		echo "Auto-discovered cluster: $cluster_name" >&2
 	fi
-	
+
 	# Find instance if not provided
 	if [ -z "$instance_id" ]; then
-		echo "Looking for instance with filter: $filter_value" >&2
+		echo "Looking for bastion instance..." >&2
 		instance_id=$(find_instance "$filter_value" "$region" "$profile")
 		if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
-			echo "Error: No instance found with the specified filter." >&2
+			echo "Error: No instance found with filter: $filter_value" >&2
 			exit 1
 		fi
 	fi
 
-	# Get endpoint if not provided
-	if [ -z "$endpoint" ]; then
-		echo "Looking up EKS cluster endpoint..." >&2
-		endpoint=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks describe-cluster \
-			--name "$cluster_name" \
-			--query cluster.endpoint \
-			--output text 2>/dev/null)
-		if [ -z "$endpoint" ] || [ "$endpoint" = "None" ]; then
-			echo "Error: No endpoint found for cluster $cluster_name" >&2
-			exit 1
-		fi
+	# Get endpoint
+	echo "Looking up EKS cluster endpoint..." >&2
+	endpoint=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks describe-cluster \
+		--name "$cluster_name" \
+		--query cluster.endpoint \
+		--output text 2>/dev/null)
+	if [ -z "$endpoint" ] || [ "$endpoint" = "None" ]; then
+		echo "Error: No endpoint found for cluster $cluster_name" >&2
+		exit 1
+	fi
+
+	# Display configuration and prompt for confirmation
+	print_logo >&2
+	echo >&2
+	echo "Session Configuration:" >&2
+	echo "  AWS Profile:    $profile" >&2
+	echo "  Region:         $region" >&2
+	echo "  Cluster:        $cluster_name" >&2
+	echo "  Bastion:        $instance_id (filter: $filter_value)" >&2
+	echo "  Endpoint:       ${endpoint#https://}" >&2
+	if [ "$uds_mode" = "false" ]; then
+		echo "  UDS Mode:       Disabled (EKS endpoint only)" >&2
+	else
+		echo "  UDS Mode:       Enabled (Istio gateway forwarding + hostctl domains)" >&2
+	fi
+	echo >&2
+
+	# Prompt for confirmation (unless -y/--yes was specified)
+	if [ "$skip_confirm" != "true" ]; then
+		echo -n "Do you want to continue? [Y/n] " >&2
+		read -r confirm
+		case "$confirm" in
+			[nN][oO]|[nN])
+				echo "Aborted." >&2
+				exit 0
+				;;
+		esac
+		echo >&2
+	fi
+
+	# Check hostctl if in UDS mode
+	if [ "$uds_mode" = "true" ]; then
+		check_hostctl
 	fi
 
 	# Strip https:// prefix if present
