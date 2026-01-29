@@ -1,0 +1,16 @@
+core-base:0.52.0-unicorn
+core-identity-authorization:0.52.0-unicorn
+core-logging:0.52.0-unicorn
+core-monitoring:0.52.0-unicorn
+core-runtime-security:0.52.0-unicorn
+gitlab>18.2.2-uds.0-unicorn
+gitlab-runner:18.2.0-uds.1-unicorn
+headlamp:0.35.0-uds.0-registry1
+init:v0.61.2
+minio-operator:7.1.1-uds.4-unicorn
+postgres-operator:1.14.0-uds.11-unicorn
+renovate:41.82.4-uds.0-unicorn
+sonarqube:25.8.0.112029-uds.0-unicorn
+uds-ui:0.21.8-unicorn
+valkey:8.1.3-uds.0-unicorn
+vault:1.20.2-uds.0-unicorn

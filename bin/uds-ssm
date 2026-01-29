@@ -1,28 +1,27 @@
 #!/usr/bin/env bash
 
 # This script manages AWS SSM sessions to EC2 instances and forwards EKS cluster endpoints to localhost.
-# It requires the AWS CLI and SSM agent to be installed and configured on the instance.
-# It also requires the AWS CLI to be configured with the necessary permissions to access EC2 and EKS resources.
-# Usage: ./udsm COMMAND [OPTIONS]
+# It includes Istio gateway port forwarding and hostctl integration for clean domain names.
+# 
+# Usage: ./uds-ssm COMMAND [OPTIONS]
 # Commands:
-#   start   Start an SSM port forwarding session
+#   start   Start an SSM port forwarding session with optional Istio gateway support
 #   stop    Stop running SSM sessions
 #   ssh     Start an interactive shell session through SSM (auto-switches to ec2-user)
 #   status  Show status of running sessions
+#   env     Output environment variables for a session
+#   logs    Show logs for a session
 #   help    Show help message
 #
-# The script creates a unique temporary directory to store session artifacts.
-# Sessions are stored in ~/.local/state/udsm/ for persistence across commands.
-#
 # Author: Mitchell Murphy
-# Date: 2025-06-28
-# Version: 1.1.0
+# Date: 2025-01-29
+# Version: 1.2.2
 
-# Default values
-DEFAULT_CLUSTER_NAME="uds-eks-dev-uds"
+# Default values (empty means auto-discover)
+DEFAULT_CLUSTER_NAME=""  # Will be auto-discovered from AWS
 DEFAULT_REGION="us-gov-east-1"
 DEFAULT_FILTER_VALUE="*bastion*"
-DEFAULT_PROFILE="jam-dev"
+DEFAULT_PROFILE="${AWS_PROFILE:-}"  # Use AWS_PROFILE from environment if set
 
 # State directory for persistent session tracking
 STATE_DIR="$HOME/.local/state/udsm"
@@ -64,15 +63,18 @@ show_start_usage() {
 	echo "Start an SSM port forwarding session to forward EKS cluster endpoint to localhost."
 	echo ""
 	echo "Options:"
-	echo "  -c, --cluster-name    EKS cluster name (default: $DEFAULT_CLUSTER_NAME)"
-	echo "  -r, --region          AWS region (default: $DEFAULT_REGION)"
-	echo "  -f, --filter          EC2 instance name filter (default: $DEFAULT_FILTER_VALUE)"
-	echo "  -i, --instance-id     EC2 instance ID (overrides filter lookup)"
-	echo "  -e, --endpoint        EKS cluster endpoint (overrides cluster lookup)"
-	echo "  -k, --kubeconfig      Create and configure a kubeconfig file"
-	echo "  -m, --merge           Merge kubeconfig into ~/.kube/config (requires -k)"
-	echo "  -p, --profile         AWS profile to use (default: $DEFAULT_PROFILE)"
-	echo "  -h, --help            Show this help message"
+	echo "  -C, --cluster-name    EKS cluster name (default: auto-discover first cluster)"
+	echo "  -R, --region          AWS region (default: $DEFAULT_REGION)"
+	echo "  -F, --filter          EC2 instance name filter (default: $DEFAULT_FILTER_VALUE)"
+	echo "  -I, --instance-id     EC2 instance ID (overrides filter lookup)"
+	echo "  -E, --endpoint        EKS cluster endpoint (overrides cluster lookup)"
+	echo "  -P, --profile         AWS profile (default: \$AWS_PROFILE from environment)"
+	echo "  -N, --no-uds          Disable UDS mode (don't forward Istio gateway ports)"
+	echo "  -y, --yes             Skip confirmation prompt"
+	echo "  -H, --help            Show this help message"
+	echo ""
+	echo "The script will auto-discover the EKS cluster and use AWS_PROFILE from your"
+	echo "environment if not explicitly specified. Use 'assume <profile>' to set AWS_PROFILE."
 }
 
 # Function to display ssh command usage
@@ -82,11 +84,11 @@ show_ssh_usage() {
 	echo "Start an interactive shell session through SSM."
 	echo ""
 	echo "Options:"
-	echo "  -r, --region          AWS region (default: $DEFAULT_REGION)"
-	echo "  -f, --filter          EC2 instance name filter (default: $DEFAULT_FILTER_VALUE)"
-	echo "  -i, --instance-id     EC2 instance ID (overrides filter lookup)"
-	echo "  -p, --profile         AWS profile to use (default: $DEFAULT_PROFILE)"
-	echo "  -h, --help            Show this help message"
+	echo "  -R, --region          AWS region (default: $DEFAULT_REGION)"
+	echo "  -F, --filter          EC2 instance name filter (default: $DEFAULT_FILTER_VALUE)"
+	echo "  -I, --instance-id     EC2 instance ID (overrides filter lookup)"
+	echo "  -P, --profile         AWS profile to use (default: $DEFAULT_PROFILE)"
+	echo "  -H, --help            Show this help message"
 }
 
 # Function to display stop command usage
@@ -96,9 +98,9 @@ show_stop_usage() {
 	echo "Stop running SSM sessions."
 	echo ""
 	echo "Options:"
-	echo "  -a, --all             Stop all running sessions"
-	echo "  -s, --session-id      Stop specific session by ID"
-	echo "  -h, --help            Show this help message"
+	echo "  -A, --all             Stop all running sessions"
+	echo "  -S, --session-id      Stop specific session by ID"
+	echo "  -H, --help            Show this help message"
 }
 
 # Function to check for required external commands
@@ -111,7 +113,7 @@ preflight() {
 
 	for cmd in "${deps[@]}"; do
 		if ! command -v "$cmd" >/dev/null 2>&1; then
-			echo "Error: $cmd is required but not installed or in PATH."
+			echo "Error: $cmd is required but not installed or in PATH." >&2
 			exit 1
 		fi
 	done
@@ -129,11 +131,38 @@ find_instance() {
 		--output text | head -n1
 }
 
+# Function to discover the first EKS cluster
+discover_eks_cluster() {
+	local region="$1"
+	local profile="$2"
+
+	local clusters
+	clusters=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks list-clusters \
+		--query "clusters[0]" \
+		--output text 2>/dev/null)
+
+	if [ -z "$clusters" ] || [ "$clusters" = "None" ] || [ "$clusters" = "null" ]; then
+		return 1
+	fi
+
+	echo "$clusters"
+}
+
+# Function to list all EKS clusters (for display)
+list_eks_clusters() {
+	local region="$1"
+	local profile="$2"
+
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws eks list-clusters \
+		--query "clusters[]" \
+		--output text 2>/dev/null
+}
+
 # Common AWS environment setup
 setup_aws_env() {
 	local region="$1"
 	local profile="$2"
-
+	
 	export AWS_REGION="$region"
 	export AWS_PROFILE="$profile"
 }
@@ -148,36 +177,36 @@ parse_common_args() {
 	local filter_value="$DEFAULT_FILTER_VALUE"
 	local help_requested=false
 	local unknown_args=()
-
+	
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--region | -r)
-			region="$2"
-			shift 2
-			;;
-		--profile | -p)
-			profile="$2"
-			shift 2
-			;;
-		--instance-id | -i)
-			instance_id="$2"
-			shift 2
-			;;
-		--filter | -f)
-			filter_value="$2"
-			shift 2
-			;;
-		--help | -h)
-			help_requested=true
-			shift
-			;;
-		*)
-			unknown_args+=("$1")
-			shift
-			;;
+			--region|-R)
+				region="$2"
+				shift 2
+				;;
+			--profile|-P)
+				profile="$2"
+				shift 2
+				;;
+			--instance-id|-I)
+				instance_id="$2"
+				shift 2
+				;;
+			--filter|-F)
+				filter_value="$2"
+				shift 2
+				;;
+			--help|-H)
+				help_requested=true
+				shift
+				;;
+			*)
+				unknown_args+=("$1")
+				shift
+				;;
 		esac
 	done
-
+	
 	# Output variable assignments for eval
 	cat <<EOF
 region="$region"
@@ -196,20 +225,20 @@ setup_instance_connection() {
 	local profile="$3"
 	local filter_value="$4"
 	local instance_id="$5"
-
+	
 	print_logo >&2
 	echo >&2
 	echo "Starting $cmd_name..." >&2
 	echo "Region: $region" >&2
 	echo "AWS Profile: $profile" >&2
 	echo >&2
-
+	
 	# Preflight checks
 	preflight "$cmd_name"
-
+	
 	# Setup AWS environment
 	setup_aws_env "$region" "$profile"
-
+	
 	# Find instance if not provided
 	if [ -z "$instance_id" ]; then
 		echo "Looking for instance with filter: $filter_value" >&2
@@ -219,13 +248,13 @@ setup_instance_connection() {
 			exit 1
 		fi
 	fi
-
+	
 	# Validate instance ID format
 	if ! [[ "$instance_id" =~ ^i-[0-9a-f]{8,17}$ ]]; then
 		echo "Error: Invalid instance ID format: $instance_id" >&2
 		exit 1
 	fi
-
+	
 	# Only output the instance ID to stdout
 	echo "$instance_id"
 }
@@ -234,67 +263,37 @@ setup_instance_connection() {
 context_exists() {
 	local context_name="$1"
 	local kubeconfig_file="$2"
-
+	
 	if [ ! -f "$kubeconfig_file" ]; then
 		return 1
 	fi
-
+	
 	KUBECONFIG="$kubeconfig_file" kubectl config get-contexts -o name 2>/dev/null | grep -q "^${context_name}$"
 }
 
-# Function to merge kubeconfig files
-merge_kubeconfig() {
-	local new_config="$1"
-	local target_config="$2"
-	local context_name="$3"
-
-	if [ ! -f "$target_config" ]; then
-		echo "Creating new kubeconfig at $target_config"
-		cp "$new_config" "$target_config"
-		return
-	fi
-
-	# Backup existing config
-	local backup_file
-	backup_file="${target_config}.backup.$(date +%Y%m%d_%H%M%S)"
-	echo "Backing up existing kubeconfig to $backup_file"
-	cp "$target_config" "$backup_file"
-
-	# Use kubectl to merge configs
-	echo "Merging kubeconfig files..."
-	if KUBECONFIG="${target_config}:${new_config}" kubectl config view --flatten >"${target_config}.tmp"; then
-		mv "${target_config}.tmp" "$target_config"
-		echo "Successfully merged kubeconfig into $target_config"
-	else
-		echo "Error: Failed to merge kubeconfig files"
-		rm -f "${target_config}.tmp"
-		return 1
-	fi
-}
 
 # Function to create the kubeconfig file
 create_kubeconfig() {
 	local cluster_name="$1"
 	local region="$2"
 	local profile="$3"
-	local merge_config="$4"
-	local kubeconfig_file="$HOME/.kube/${cluster_name}-config"
+	local temp_dir="$4"
+	local kubeconfig_file="$temp_dir/kubeconfig"
 
-	mkdir -p "$HOME/.kube"
+	echo "Creating kubeconfig file..." >&2
 
-	if [ -f "$kubeconfig_file" ]; then
-		echo "Kubeconfig file already exists at $kubeconfig_file"
-		echo "Do you want to overwrite it? (yes/no): "
-		read -r overwrite_confirmation
+	# NOTE: We intentionally do NOT embed AWS credentials in the kubeconfig.
+	#
+	# When using granted/assume, credentials are short-lived STS tokens that expire
+	# (typically after 1 hour). If we embed them, kubectl will fail once they expire.
+	#
+	# Instead, we let `aws eks get-token` use the default AWS credential chain,
+	# which will pick up credentials from the user's current environment.
+	#
+	# This means users must ensure they have valid AWS credentials (via granted,
+	# profiles, or other means) when running kubectl commands.
 
-		if [[ "$overwrite_confirmation" != "yes" && "$overwrite_confirmation" != "y" ]]; then
-			echo "Skipping kubeconfig creation."
-			return
-		fi
-	fi
-
-	echo "Creating kubeconfig file at $kubeconfig_file..."
-	cat >"$kubeconfig_file" <<EOF
+	cat > "$kubeconfig_file" <<EOF
 apiVersion: v1
 clusters:
 - cluster:
@@ -324,28 +323,9 @@ users:
       - --output
       - json
       command: aws
-      env:
-      - name: AWS_PROFILE
-        value: $profile
 EOF
 
-	echo "Kubeconfig created at $kubeconfig_file"
-
-	if [ "$merge_config" = "true" ]; then
-		# Check if context already exists
-		if context_exists "$cluster_name-context" "$HOME/.kube/config"; then
-			echo "Context '$cluster_name-context' already exists in ~/.kube/config"
-		else
-			if merge_kubeconfig "$kubeconfig_file" "$HOME/.kube/config" "$cluster_name-context"; then
-				echo "Context '$cluster_name-context' has been added to ~/.kube/config"
-			fi
-		fi
-		echo "To use this context, run:"
-		echo "  kubectl config use-context $cluster_name-context"
-	else
-		# Return the kubeconfig path for the caller to use
-		echo "KUBECONFIG_PATH=$kubeconfig_file"
-	fi
+	echo "$kubeconfig_file"
 }
 
 # Function to save session info
@@ -355,14 +335,20 @@ save_session_info() {
 	local instance_id="$3"
 	local cluster_name="$4"
 	local temp_dir="$5"
+	local uds_mode="${6:-false}"
+	local kubeconfig_path="${7:-}"
+	local original_kubeconfig="${8:-}"
 
-	cat >"$STATE_DIR/${session_id}.json" <<EOF
+	cat > "$STATE_DIR/${session_id}.json" <<EOF
 {
   "session_id": "$session_id",
   "pid": "$pid",
   "instance_id": "$instance_id",
   "cluster_name": "$cluster_name",
   "temp_dir": "$temp_dir",
+  "uds_mode": "$uds_mode",
+  "kubeconfig_path": "$kubeconfig_path",
+  "original_kubeconfig": "$original_kubeconfig",
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -373,24 +359,41 @@ cleanup_session() {
 	local session_file="$1"
 
 	if [ -f "$session_file" ]; then
-		local pid
-		pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
-		local temp_dir
-		temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
+		local pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
+		local temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
+		local uds_mode=$(grep -o '"uds_mode": "[^"]*"' "$session_file" | sed 's/"uds_mode": "//' | sed 's/"$//')
+		local session_id=$(basename "$session_file" .json)
+
+		# Stop Istio forwarding if in UDS mode
+		if [ "$uds_mode" = "true" ]; then
+			stop_istio_forwarding "$session_id"
+
+			# Remove hostctl domains
+			if [ -f "$STATE_DIR/${session_id}.hostctl" ]; then
+				local hostctl_profile=$(cat "$STATE_DIR/${session_id}.hostctl")
+				remove_hostctl_domains "$hostctl_profile"
+				rm -f "$STATE_DIR/${session_id}.hostctl"
+			fi
+		fi
 
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-			echo "Terminating SSM session (PID: $pid)..."
+			echo "Terminating SSM session (PID: $pid)..." >&2
 			kill -9 "$pid" 2>/dev/null
 		fi
 
 		if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
-			echo "Cleaning up temporary directory: $temp_dir"
+			echo "Cleaning up temporary directory: $temp_dir" >&2
 			rm -rf "$temp_dir"
 		fi
 
 		rm -f "$session_file"
 		# Also remove associated kubeconfig info
 		rm -f "${session_file%.json}.kubeconfig"
+
+		# Kill sudo keepalive if it exists
+		if [ -n "$SUDO_KEEPALIVE_PID" ] && kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
+			kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+		fi
 	fi
 }
 
@@ -403,36 +406,36 @@ parse_start_args() {
 	# Start-specific defaults
 	local cluster_name="$DEFAULT_CLUSTER_NAME"
 	local endpoint=""
-	local create_kubeconfig=false
-	local merge_kubeconfig=false
+	local uds_mode=true
+	local skip_confirm=false
 
 	# Re-parse for start-specific options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--cluster-name | -c)
-			cluster_name="$2"
-			shift 2
-			;;
-		--endpoint | -e)
-			endpoint="$2"
-			shift 2
-			;;
-		--kubeconfig | -k)
-			create_kubeconfig=true
-			shift
-			;;
-		--merge | -m)
-			merge_kubeconfig=true
-			shift
-			;;
-		--region | -r | --profile | -p | --instance-id | -i | --filter | -f | --help | -h)
-			# Already handled by parse_common_args
-			shift
-			[[ "$1" =~ ^- ]] || shift
-			;;
-		*)
-			shift
-			;;
+			--cluster-name|-C)
+				cluster_name="$2"
+				shift 2
+				;;
+			--endpoint|-E)
+				endpoint="$2"
+				shift 2
+				;;
+			--no-uds|-N)
+				uds_mode=false
+				shift
+				;;
+			--yes|-y)
+				skip_confirm=true
+				shift
+				;;
+			--region|-R|--profile|-P|--instance-id|-I|--filter|-F|--help|-H)
+				# Already handled by parse_common_args
+				shift
+				[[ "$1" =~ ^- ]] || shift
+				;;
+			*)
+				shift
+				;;
 		esac
 	done
 
@@ -445,9 +448,247 @@ filter_value="$filter_value"
 help_requested=$help_requested
 cluster_name="$cluster_name"
 endpoint="$endpoint"
-create_kubeconfig=$create_kubeconfig
-merge_kubeconfig=$merge_kubeconfig
+uds_mode=$uds_mode
+skip_confirm=$skip_confirm
 EOF
+}
+
+# Function to check for hostctl
+check_hostctl() {
+	if ! command -v hostctl &>/dev/null; then
+		echo "Error: hostctl is not installed. Please install hostctl and try again." >&2
+		echo "Visit: https://github.com/guumaster/hostctl for installation instructions" >&2
+		echo "On macOS: brew install hostctl" >&2
+		exit 1
+	fi
+
+	# Prompt for sudo password once
+	echo "hostctl requires sudo access to modify /etc/hosts" >&2
+	echo "Please enter your password:" >&2
+	sudo -v
+	if [ $? -ne 0 ]; then
+		echo "Error: Failed to obtain sudo credentials" >&2
+		exit 1
+	fi
+
+	# Keep sudo credentials alive in the background
+	(while true; do sudo -n true; sleep 50; done) &
+	SUDO_KEEPALIVE_PID=$!
+	trap "kill $SUDO_KEEPALIVE_PID 2>/dev/null" EXIT
+}
+
+# Function to get hostctl command with sudo
+get_hostctl_cmd() {
+	echo "sudo $(which hostctl)"
+}
+
+# Function to setup hostctl domains
+setup_hostctl_domains() {
+	local profile_name="$1"
+
+	echo "Setting up UDS domains using hostctl..." >&2
+
+	local HOSTCTL_CMD=$(get_hostctl_cmd)
+
+	# Remove existing profile if it exists (suppress output for non-existent profiles)
+	$HOSTCTL_CMD remove "$profile_name" >/dev/null 2>&1 || true
+
+	# Add tenant gateway domain
+	echo "Adding tenant gateway domain..." >&2
+	$HOSTCTL_CMD add domains "$profile_name" sso.uds.dev --ip 127.0.0.1 >&2
+
+	# Enable the profile
+	$HOSTCTL_CMD enable "$profile_name" >&2
+
+	echo "✓ Hostctl profile '$profile_name' created and enabled" >&2
+	echo "" >&2
+	echo "Current hostctl status:" >&2
+	$HOSTCTL_CMD status >&2
+}
+
+# Function to remove hostctl domains
+remove_hostctl_domains() {
+	local profile_name="$1"
+
+	echo "Removing UDS domains from hostctl..." >&2
+
+	local HOSTCTL_CMD=$(get_hostctl_cmd)
+
+	# Disable and remove the profile (suppress all output)
+	$HOSTCTL_CMD disable "$profile_name" >/dev/null 2>&1 || true
+	$HOSTCTL_CMD remove "$profile_name" >/dev/null 2>&1 || true
+
+	echo "✓ Hostctl profile '$profile_name' removed" >&2
+}
+
+# Function to get Istio gateway IP
+get_istio_gateway_ip() {
+	local kubeconfig="$1"
+	local namespace="$2"
+	local service_name="$3"
+	
+	# Get the hostname from the service
+	local hostname=$(kubectl --kubeconfig "$kubeconfig" get svc -n "$namespace" "$service_name" -o=jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+	
+	if [ -z "$hostname" ] || [ "$hostname" = "null" ]; then
+		echo "Error: Could not get hostname for service $service_name in namespace $namespace" >&2
+		return 1
+	fi
+	
+	# Resolve the hostname to an IP address
+	local ip=$(nslookup "$hostname" 2>/dev/null | awk '/^Address: / && !f {print $2; f=1}')
+	
+	if [ -z "$ip" ]; then
+		echo "Error: Could not resolve hostname $hostname to IP" >&2
+		return 1
+	fi
+	
+	echo "$ip"
+}
+
+# Function to start Istio port forwarding
+start_istio_forwarding() {
+	local instance_id="$1"
+	local region="$2"
+	local profile="$3"
+	local session_id="$4"
+	local kubeconfig="$5"
+
+	echo "" >&2
+	echo "Starting Istio gateway port forwarding..." >&2
+
+	# Get the tenant gateway IP
+	echo "Getting tenant gateway IP address..." >&2
+	local tenant_ip=$(get_istio_gateway_ip "$kubeconfig" "istio-tenant-gateway" "tenant-ingressgateway")
+	if [ -z "$tenant_ip" ]; then
+		echo "Warning: Could not get tenant gateway IP, using default 10.0.0.11" >&2
+		tenant_ip="10.0.0.11"
+	else
+		echo "Tenant gateway IP: $tenant_ip" >&2
+	fi
+
+	# Get the admin gateway IP
+	echo "Getting admin gateway IP address..." >&2
+	local admin_ip=$(get_istio_gateway_ip "$kubeconfig" "istio-admin-gateway" "admin-ingressgateway")
+	if [ -z "$admin_ip" ]; then
+		echo "Warning: Could not get admin gateway IP, using tenant IP $tenant_ip" >&2
+		admin_ip="$tenant_ip"
+	else
+		echo "Admin gateway IP: $admin_ip" >&2
+	fi
+
+	# Create directory for Istio PIDs
+	local istio_pid_dir="$STATE_DIR/${session_id}-istio"
+	mkdir -p "$istio_pid_dir"
+
+	# Tenant gateway HTTPS (NodePort 32521) -> 443
+	echo "  Starting tenant gateway HTTPS forwarding (443 -> $tenant_ip:32521)..." >&2
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws ssm start-session \
+		--target "$instance_id" \
+		--document-name AWS-StartPortForwardingSessionToRemoteHost \
+		--parameters "host=$tenant_ip,portNumber=32521,localPortNumber=443" \
+		>/dev/null 2>&1 &
+	local tenant_https_pid=$!
+	echo "$tenant_https_pid" > "$istio_pid_dir/tenant-https.pid"
+
+	# Tenant gateway HTTP (NodePort 30720) -> 80
+	echo "  Starting tenant gateway HTTP forwarding (80 -> $tenant_ip:30720)..." >&2
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws ssm start-session \
+		--target "$instance_id" \
+		--document-name AWS-StartPortForwardingSessionToRemoteHost \
+		--parameters "host=$tenant_ip,portNumber=30720,localPortNumber=80" \
+		>/dev/null 2>&1 &
+	local tenant_http_pid=$!
+	echo "$tenant_http_pid" > "$istio_pid_dir/tenant-http.pid"
+
+	# Admin gateway HTTPS (NodePort 32520) -> 9443
+	echo "  Starting admin gateway HTTPS forwarding (9443 -> $admin_ip:32520)..." >&2
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws ssm start-session \
+		--target "$instance_id" \
+		--document-name AWS-StartPortForwardingSessionToRemoteHost \
+		--parameters "host=$admin_ip,portNumber=32520,localPortNumber=9443" \
+		>/dev/null 2>&1 &
+	local admin_https_pid=$!
+	echo "$admin_https_pid" > "$istio_pid_dir/admin-https.pid"
+
+	# Admin gateway HTTP (NodePort 31452) -> 9080
+	echo "  Starting admin gateway HTTP forwarding (9080 -> $admin_ip:31452)..." >&2
+	AWS_REGION="$region" AWS_PROFILE="$profile" aws ssm start-session \
+		--target "$instance_id" \
+		--document-name AWS-StartPortForwardingSessionToRemoteHost \
+		--parameters "host=$admin_ip,portNumber=31452,localPortNumber=9080" \
+		>/dev/null 2>&1 &
+	local admin_http_pid=$!
+	echo "$admin_http_pid" > "$istio_pid_dir/admin-http.pid"
+
+	# Wait a bit for ports to come up
+	echo "" >&2
+	echo "Waiting for port forwarding to establish..." >&2
+	sleep 5
+
+	# Check ports
+	echo "" >&2
+	echo "Checking Istio gateway port forwarding..." >&2
+	local all_good=true
+
+	if nc -z localhost 443 2>/dev/null; then
+		echo "  ✓ Tenant HTTPS (port 443)" >&2
+	else
+		echo "  ✗ Tenant HTTPS failed (port 443)" >&2
+		all_good=false
+	fi
+
+	if nc -z localhost 80 2>/dev/null; then
+		echo "  ✓ Tenant HTTP  (port 80)" >&2
+	else
+		echo "  ✗ Tenant HTTP  failed (port 80)" >&2
+		all_good=false
+	fi
+
+	if nc -z localhost 9443 2>/dev/null; then
+		echo "  ✓ Admin HTTPS  (port 9443)" >&2
+	else
+		echo "  ✗ Admin HTTPS  failed (port 9443)" >&2
+		all_good=false
+	fi
+
+	if nc -z localhost 9080 2>/dev/null; then
+		echo "  ✓ Admin HTTP   (port 9080)" >&2
+	else
+		echo "  ✗ Admin HTTP   failed (port 9080)" >&2
+		all_good=false
+	fi
+
+	if [ "$all_good" = "true" ]; then
+		return 0
+	else
+		echo "" >&2
+		echo "Warning: Some Istio gateway ports failed to forward" >&2
+		return 1
+	fi
+}
+
+# Function to stop Istio port forwarding
+stop_istio_forwarding() {
+	local session_id="$1"
+
+	echo "Stopping Istio gateway port forwarding..." >&2
+
+	local istio_pid_dir="$STATE_DIR/${session_id}-istio"
+
+	if [ -d "$istio_pid_dir" ]; then
+		for pid_file in "$istio_pid_dir"/*.pid; do
+			if [ -f "$pid_file" ]; then
+				local pid=$(cat "$pid_file")
+				if kill -0 "$pid" 2>/dev/null; then
+					kill -9 "$pid" 2>/dev/null
+					echo "  Stopped PID $pid" >&2
+				fi
+				rm -f "$pid_file"
+			fi
+		done
+		rmdir "$istio_pid_dir" 2>/dev/null || true
+	fi
 }
 
 # Start command implementation
@@ -461,85 +702,125 @@ cmd_start() {
 		exit 0
 	fi
 
+	# Check if profile is set
+	if [ -z "$profile" ]; then
+		echo "Error: No AWS profile specified." >&2
+		echo "" >&2
+		echo "Either:" >&2
+		echo "  1. Set AWS_PROFILE environment variable (e.g., using 'assume <profile>')" >&2
+		echo "  2. Use the -P/--profile option" >&2
+		exit 1
+	fi
+
 	# Setup AWS environment
 	setup_aws_env "$region" "$profile"
-
-	print_logo
-	echo
-	echo "Starting SSM port forwarding session..."
-	echo "Cluster Name: $cluster_name"
-	echo "Region: $region"
-	echo "AWS Profile: $profile"
-	echo
 
 	# Preflight checks
 	preflight "start"
 
+	# Auto-discover cluster if not provided
+	if [ -z "$cluster_name" ]; then
+		echo "Discovering EKS clusters..." >&2
+		cluster_name=$(discover_eks_cluster "$region" "$profile")
+		if [ -z "$cluster_name" ]; then
+			echo "Error: No EKS clusters found in region $region with profile $profile" >&2
+			echo "" >&2
+			echo "Available clusters:" >&2
+			list_eks_clusters "$region" "$profile" >&2 || echo "  (none found)" >&2
+			exit 1
+		fi
+		echo "Auto-discovered cluster: $cluster_name" >&2
+	fi
+
 	# Find instance if not provided
 	if [ -z "$instance_id" ]; then
-		echo "Looking for instance with filter: $filter_value"
+		echo "Looking for bastion instance..." >&2
 		instance_id=$(find_instance "$filter_value" "$region" "$profile")
 		if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
-			echo "Error: No instance found with the specified filter."
+			echo "Error: No instance found with filter: $filter_value" >&2
 			exit 1
 		fi
 	fi
 
-	# Get endpoint if not provided
-	if [ -z "$endpoint" ]; then
-		echo "Looking up EKS cluster endpoint..."
-		endpoint=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks describe-cluster \
-			--name "$cluster_name" \
-			--query cluster.endpoint \
-			--output text 2>/dev/null)
-		if [ -z "$endpoint" ] || [ "$endpoint" = "None" ]; then
-			echo "Error: No endpoint found for cluster $cluster_name"
-			exit 1
-		fi
+	# Get endpoint
+	echo "Looking up EKS cluster endpoint..." >&2
+	endpoint=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws eks describe-cluster \
+		--name "$cluster_name" \
+		--query cluster.endpoint \
+		--output text 2>/dev/null)
+	if [ -z "$endpoint" ] || [ "$endpoint" = "None" ]; then
+		echo "Error: No endpoint found for cluster $cluster_name" >&2
+		exit 1
+	fi
+
+	# Display configuration and prompt for confirmation
+	print_logo >&2
+	echo >&2
+	echo "Session Configuration:" >&2
+	echo "  AWS Profile:    $profile" >&2
+	echo "  Region:         $region" >&2
+	echo "  Cluster:        $cluster_name" >&2
+	echo "  Bastion:        $instance_id (filter: $filter_value)" >&2
+	echo "  Endpoint:       ${endpoint#https://}" >&2
+	if [ "$uds_mode" = "false" ]; then
+		echo "  UDS Mode:       Disabled (EKS endpoint only)" >&2
+	else
+		echo "  UDS Mode:       Enabled (Istio gateway forwarding + hostctl domains)" >&2
+	fi
+	echo >&2
+
+	# Prompt for confirmation (unless -y/--yes was specified)
+	if [ "$skip_confirm" != "true" ]; then
+		echo -n "Do you want to continue? [Y/n] " >&2
+		read -r confirm
+		case "$confirm" in
+			[nN][oO]|[nN])
+				echo "Aborted." >&2
+				exit 0
+				;;
+		esac
+		echo >&2
+	fi
+
+	# Check hostctl if in UDS mode
+	if [ "$uds_mode" = "true" ]; then
+		check_hostctl
 	fi
 
 	# Strip https:// prefix if present
 	endpoint=${endpoint#https://}
 
-	echo "Instance ID: $instance_id"
-	echo "Endpoint: $endpoint"
-
+	echo "Instance ID: $instance_id" >&2
+	echo "Endpoint: $endpoint" >&2
+	
 	# Verify instance state
-	local instance_state
-	instance_state=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
+	local instance_state=$(AWS_REGION="$region" AWS_PROFILE="$profile" aws ec2 describe-instances \
 		--instance-ids "$instance_id" \
 		--query "Reservations[0].Instances[0].State.Name" \
 		--output text 2>/dev/null)
 
 	if [ "$instance_state" != "running" ]; then
-		echo "Error: Instance $instance_id is not running. Current state: $instance_state"
+		echo "Error: Instance $instance_id is not running. Current state: $instance_state" >&2
 		exit 1
 	fi
 
-	# Validate merge flag requires kubeconfig flag
-	if [ "$merge_kubeconfig" = "true" ] && [ "$create_kubeconfig" = "false" ]; then
-		echo "Error: --merge requires --kubeconfig to be specified"
-		exit 1
-	fi
-
-	# Create kubeconfig if requested
-	if [ "$create_kubeconfig" = "true" ]; then
-		create_kubeconfig "$cluster_name" "$region" "$profile" "$merge_kubeconfig"
-	fi
 
 	# Create temp directory for session
-	local temp_dir
-	temp_dir=$(mktemp -d -t udsm.XXXXXX)
+	local temp_dir=$(mktemp -d -t udsm.XXXXXX)
 	if [ ! -d "$temp_dir" ]; then
-		echo "Error: Failed to create temporary directory"
+		echo "Error: Failed to create temporary directory" >&2
 		exit 1
 	fi
 
+	# Create kubeconfig
+	local kubeconfig_file=$(create_kubeconfig "$cluster_name" "$region" "$profile" "$temp_dir")
+	echo "Kubeconfig created at: $kubeconfig_file" >&2
+	
 	local log_file="$temp_dir/session.log"
 	local pid_file="$temp_dir/session.pid"
-
+	
 	# Start SSM session
-	echo "Starting SSM port forwarding session..."
+	echo "Starting SSM port forwarding session..." >&2
 	# Use env to ensure environment variables are properly set
 	env AWS_REGION="$region" AWS_PROFILE="$profile" nohup aws ssm start-session \
 		--target "$instance_id" \
@@ -548,10 +829,10 @@ cmd_start() {
 		>"$log_file" 2>&1 &
 
 	local session_pid=$!
-	echo "$session_pid" >"$pid_file"
+	echo "$session_pid" > "$pid_file"
 
 	# Wait for port to be available
-	echo "Waiting for port forwarding to establish..."
+	echo "Waiting for port forwarding to establish..." >&2
 	local max_attempts=30
 	local attempt=0
 	local port_ready=false
@@ -559,9 +840,9 @@ cmd_start() {
 	while [ $attempt -lt $max_attempts ]; do
 		# Check if process is still running
 		if ! kill -0 $session_pid 2>/dev/null; then
-			echo "Error: SSM session process died. Check logs at: $log_file"
-			echo "Last 10 lines of log:"
-			tail -10 "$log_file"
+			echo "Error: SSM session process died. Check logs at: $log_file" >&2
+			echo "Last 10 lines of log:" >&2
+			tail -10 "$log_file" >&2
 			rm -rf "$temp_dir"
 			exit 1
 		fi
@@ -577,105 +858,111 @@ cmd_start() {
 
 		# Show progress
 		if [ $((attempt % 5)) -eq 0 ]; then
-			echo "  Still waiting... ($attempt/$max_attempts)"
+			echo "  Still waiting... ($attempt/$max_attempts)" >&2
 		fi
 	done
 
 	if [ "$port_ready" = "false" ]; then
-		echo "Error: Port forwarding failed to establish after $max_attempts seconds"
-		echo "Session log:"
-		tail -20 "$log_file"
+		echo "Error: Port forwarding failed to establish after $max_attempts seconds" >&2
+		echo "Session log:" >&2
+		tail -20 "$log_file" >&2
 		kill -9 $session_pid 2>/dev/null
 		rm -rf "$temp_dir"
 		exit 1
 	fi
-
+	
 	# Generate session ID
-	local session_id
-	session_id="ssm-$(date +%s)-$$"
+	local session_id="ssm-$(date +%s)-$$"
 
-	# Save session info
-	save_session_info "$session_id" "$session_pid" "$instance_id" "$cluster_name" "$temp_dir"
+	# Capture original KUBECONFIG before we change it
+	local original_kubeconfig="${KUBECONFIG:-}"
 
-	# Store kubeconfig path if created
-	local kubeconfig_path=""
-	if [ "$create_kubeconfig" = "true" ] && [ "$merge_kubeconfig" = "false" ]; then
-		kubeconfig_path="$HOME/.kube/${cluster_name}-config"
-		echo "{\"kubeconfig_path\": \"$kubeconfig_path\"}" >"$STATE_DIR/${session_id}.kubeconfig"
-	fi
+	# Save session info (including original KUBECONFIG for restoration on stop)
+	save_session_info "$session_id" "$session_pid" "$instance_id" "$cluster_name" "$temp_dir" "$uds_mode" "$kubeconfig_file" "$original_kubeconfig"
 
-	echo
-	echo "✓ SSM session started successfully!"
-	echo "  Session ID: $session_id"
-	echo "  Process ID: $session_pid"
-	echo "  Log file: $log_file"
-	echo
-	echo "The EKS API server is now accessible at: https://localhost:8443"
-
-	# Quick connectivity test
-	echo
-	echo "Testing connectivity..."
-	if curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://localhost:8443 | grep -q "[4-5][0-9][0-9]"; then
-		echo "✓ Port forwarding is working correctly"
-	else
-		echo "⚠ Warning: Could not verify endpoint connectivity"
-		echo "  The port is open but the endpoint may still be initializing"
-	fi
-
-	if [ "$create_kubeconfig" = "true" ]; then
-		echo
-		if [ "$merge_kubeconfig" = "true" ]; then
-			# Context is either already existed or was just merged
-			echo "To use kubectl with this cluster:"
-			echo "  kubectl config use-context ${cluster_name}-context"
-			echo "  kubectl get nodes"
+	# Store kubeconfig path
+	echo "{\"kubeconfig_path\": \"$kubeconfig_file\", \"original_kubeconfig\": \"$original_kubeconfig\"}" > "$STATE_DIR/${session_id}.kubeconfig"
+	
+	# Setup UDS mode if requested
+	if [ "$uds_mode" = "true" ]; then
+		# Setup Istio port forwarding
+		if start_istio_forwarding "$instance_id" "$region" "$profile" "$session_id" "$kubeconfig_file"; then
+			# Setup hostctl domains
+			local hostctl_profile="uds-${cluster_name:-$session_id}"
+			setup_hostctl_domains "$hostctl_profile"
+			
+			# Save hostctl profile name to session
+			echo "$hostctl_profile" > "$STATE_DIR/${session_id}.hostctl"
 		else
-			echo "IMPORTANT: To use kubectl with this session, first set the kubeconfig:"
-			echo "  export KUBECONFIG=$HOME/.kube/${cluster_name}-config"
-			echo
-			echo "Or source the session environment:"
-			echo "  eval \$(udsm env -s $session_id)"
-			echo
-			echo "Then set the context and use kubectl:"
-			echo "  kubectl config use-context ${cluster_name}-context"
-			echo "  kubectl get nodes"
+			echo "Warning: Istio port forwarding setup had issues"
 		fi
 	fi
+	
+	echo >&2
+	echo "✓ SSM session started successfully!" >&2
+	echo "  Session ID: $session_id" >&2
+	echo "  Process ID: $session_pid" >&2
+	echo "  Log file: $log_file" >&2
+	echo >&2
+	echo "The EKS API server is now accessible at: https://localhost:8443" >&2
 
-	echo
-	echo "To stop this session, run: $0 stop -s $session_id"
+	if [ "$uds_mode" = "true" ]; then
+		echo "" >&2
+		echo "UDS domains are configured:" >&2
+		echo "  Tenant SSO: https://sso.uds.dev" >&2
+	fi
+
+	# Quick connectivity test
+	echo >&2
+	echo "Testing connectivity..." >&2
+	if curl -k -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://localhost:8443 | grep -q "[4-5][0-9][0-9]"; then
+		echo "✓ Port forwarding is working correctly" >&2
+	else
+		echo "⚠ Warning: Could not verify endpoint connectivity" >&2
+		echo "  The port is open but the endpoint may still be initializing" >&2
+	fi
+
+	echo >&2
+	echo "To use kubectl with this session, run:" >&2
+	echo "  eval \$(uds-ssm env -S $session_id)" >&2
+	echo >&2
+	echo "To stop this session, run: $0 stop -S $session_id" >&2
+
+	# Output the export statement to stdout for easy eval capture
+	# Usage: eval $(uds-ssm start 2>/dev/null)
+	echo "export KUBECONFIG='$kubeconfig_file'"
 }
 
 # SSH command implementation
 cmd_ssh() {
 	# Parse arguments
 	eval "$(parse_common_args "$@")"
-
+	
 	# Handle help
 	if [ "$help_requested" = "true" ]; then
 		show_ssh_usage
 		exit 0
 	fi
-
+	
 	# Check for unknown arguments
 	if [ ${#unknown_args[@]} -gt 0 ]; then
 		echo "Unknown option: ${unknown_args[0]}"
 		show_ssh_usage
 		exit 1
 	fi
-
+	
 	# Setup instance connection
 	instance_id=$(setup_instance_connection "shell session through SSM" "$region" "$profile" "$filter_value" "$instance_id")
-
+	
 	echo "Instance ID: $instance_id"
 	echo "Connecting..."
 	echo
 	echo "Note: Automatically switching to ec2-user. Type 'exit' to disconnect."
 	echo
-
+	
 	# Start SSM session with command to switch to ec2-user
 	local switch_user_cmd='sudo -i -u ec2-user'
-
+	
 	exec aws ssm start-session \
 		--target "$instance_id" \
 		--document-name AWS-StartInteractiveCommand \
@@ -686,94 +973,109 @@ cmd_ssh() {
 cmd_stop() {
 	local stop_all=false
 	local session_id=""
+	local original_args=("$@")  # Save original arguments
 
 	# Parse stop command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--all | -a)
-			stop_all=true
-			shift
-			;;
-		--session-id | -s)
-			session_id="$2"
-			shift 2
-			;;
-		--help | -h)
-			show_stop_usage
-			exit 0
-			;;
-		*)
-			echo "Unknown option: $1"
-			show_stop_usage
-			exit 1
-			;;
+			--all|-A)
+				stop_all=true
+				shift
+				;;
+			--session-id|-S)
+				session_id="$2"
+				shift 2
+				;;
+			--help|-H)
+				show_stop_usage
+				exit 0
+				;;
+			*)
+				echo "Unknown option: $1" >&2
+				show_stop_usage
+				exit 1
+				;;
 		esac
 	done
 
+	# Variable to collect original kubeconfigs for restoration
+	local restore_kubeconfig=""
+
 	if [ "$stop_all" = "true" ]; then
-		echo "Stopping all SSM sessions..."
+		echo "Stopping all SSM sessions..." >&2
 		local count=0
 		for session_file in "$STATE_DIR"/*.json; do
 			if [ -f "$session_file" ]; then
+				# Extract original kubeconfig before cleanup (use last one found)
+				restore_kubeconfig=$(grep -o '"original_kubeconfig": "[^"]*"' "$session_file" 2>/dev/null | sed 's/"original_kubeconfig": "//' | sed 's/"$//' || true)
 				cleanup_session "$session_file"
 				((count++))
 			fi
 		done
-		echo "Stopped $count session(s)."
+		echo "Stopped $count session(s)." >&2
 	elif [ -n "$session_id" ]; then
 		local session_file="$STATE_DIR/${session_id}.json"
 		if [ -f "$session_file" ]; then
-			echo "Stopping session: $session_id"
+			# Extract original kubeconfig before cleanup
+			restore_kubeconfig=$(grep -o '"original_kubeconfig": "[^"]*"' "$session_file" 2>/dev/null | sed 's/"original_kubeconfig": "//' | sed 's/"$//' || true)
+			echo "Stopping session: $session_id" >&2
 			cleanup_session "$session_file"
-			echo "Session stopped."
+			echo "Session stopped." >&2
 		else
-			echo "Error: Session not found: $session_id"
+			echo "Error: Session not found: $session_id" >&2
 			exit 1
 		fi
 	else
-		echo "Error: Either --all or --session-id must be specified"
+		echo "Error: Either --all or --session-id must be specified" >&2
 		show_stop_usage
 		exit 1
+	fi
+
+	# Output the KUBECONFIG restore command to stdout
+	# Usage: eval $(uds-ssm stop -S <session-id> 2>/dev/null)
+	if [ -n "$restore_kubeconfig" ]; then
+		echo "export KUBECONFIG='$restore_kubeconfig'"
+	else
+		echo "unset KUBECONFIG"
 	fi
 }
 
 # Env command implementation
 cmd_env() {
 	local session_id=""
-
+	
 	# Parse env command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--session-id | -s)
-			session_id="$2"
-			shift 2
-			;;
-		--help | -h)
-			echo "Usage: $0 env [OPTIONS]"
-			echo ""
-			echo "Output environment variables for a session."
-			echo ""
-			echo "Options:"
-			echo "  -s, --session-id      Session ID to get environment for"
-			echo "  -h, --help            Show this help message"
-			exit 0
-			;;
-		*)
-			echo "Unknown option: $1"
-			exit 1
-			;;
+			--session-id|-S)
+				session_id="$2"
+				shift 2
+				;;
+			--help|-H)
+				echo "Usage: $0 env [OPTIONS]"
+				echo ""
+				echo "Output environment variables for a session."
+				echo ""
+				echo "Options:"
+				echo "  -S, --session-id      Session ID to get environment for"
+				echo "  -H, --help            Show this help message"
+				exit 0
+				;;
+			*)
+				echo "Unknown option: $1"
+				exit 1
+				;;
 		esac
 	done
-
+	
 	if [ -z "$session_id" ]; then
 		echo "Error: --session-id is required"
 		exit 1
 	fi
-
+	
 	local kubeconfig_file="$STATE_DIR/${session_id}.kubeconfig"
 	if [ -f "$kubeconfig_file" ]; then
-		local kubeconfig_path
-		kubeconfig_path=$(grep -o '"kubeconfig_path": "[^"]*"' "$kubeconfig_file" | sed 's/"kubeconfig_path": "//' | sed 's/"$//')
+		local kubeconfig_path=$(grep -o '"kubeconfig_path": "[^"]*"' "$kubeconfig_file" | sed 's/"kubeconfig_path": "//' | sed 's/"$//')
 		if [ -n "$kubeconfig_path" ] && [ -f "$kubeconfig_path" ]; then
 			echo "export KUBECONFIG='$kubeconfig_path'"
 		else
@@ -790,61 +1092,60 @@ cmd_env() {
 cmd_logs() {
 	local session_id=""
 	local follow=false
-
+	
 	# Parse logs command options
 	while [[ $# -gt 0 ]]; do
 		case $1 in
-		--session-id | -s)
-			session_id="$2"
-			shift 2
-			;;
-		--follow | -f)
-			follow=true
-			shift
-			;;
-		--help | -h)
-			echo "Usage: $0 logs [OPTIONS]"
-			echo ""
-			echo "Show logs for a session."
-			echo ""
-			echo "Options:"
-			echo "  -s, --session-id      Session ID to show logs for (required)"
-			echo "  -f, --follow          Follow log output"
-			echo "  -h, --help            Show this help message"
-			exit 0
-			;;
-		*)
-			echo "Unknown option: $1"
-			exit 1
-			;;
+			--session-id|-S)
+				session_id="$2"
+				shift 2
+				;;
+			--follow|-F)
+				follow=true
+				shift
+				;;
+			--help|-H)
+				echo "Usage: $0 logs [OPTIONS]"
+				echo ""
+				echo "Show logs for a session."
+				echo ""
+				echo "Options:"
+				echo "  -S, --session-id      Session ID to show logs for (required)"
+				echo "  -F, --follow          Follow log output"
+				echo "  -H, --help            Show this help message"
+				exit 0
+				;;
+			*)
+				echo "Unknown option: $1"
+				exit 1
+				;;
 		esac
 	done
-
+	
 	if [ -z "$session_id" ]; then
 		echo "Error: --session-id is required"
 		exit 1
 	fi
-
+	
 	local session_file="$STATE_DIR/${session_id}.json"
 	if [ ! -f "$session_file" ]; then
 		echo "Error: Session not found: $session_id"
 		exit 1
 	fi
-
-	local temp_dir
-	temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
+	
+	local temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
 	local log_file="$temp_dir/session.log"
-
+	
 	if [ ! -f "$log_file" ]; then
 		echo "Error: Log file not found for session: $session_id"
 		echo "Expected location: $log_file"
 		exit 1
 	fi
-
+	
 	echo "Session: $session_id"
 	echo "Log file: $log_file"
 	echo "---"
-
+	
 	if [ "$follow" = "true" ]; then
 		tail -f "$log_file"
 	else
@@ -856,22 +1157,18 @@ cmd_logs() {
 cmd_status() {
 	echo "Active SSM Sessions:"
 	echo
-
+	
 	local found=false
 	for session_file in "$STATE_DIR"/*.json; do
 		if [ -f "$session_file" ]; then
 			found=true
-			local session_id
-			session_id=$(basename "$session_file" .json)
-			local pid
-			pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
-			local instance_id
-			instance_id=$(grep -o '"instance_id": "[^"]*"' "$session_file" | sed 's/"instance_id": "//' | sed 's/"$//')
-			local cluster_name
-			cluster_name=$(grep -o '"cluster_name": "[^"]*"' "$session_file" | sed 's/"cluster_name": "//' | sed 's/"$//')
-			local started_at
-			started_at=$(grep -o '"started_at": "[^"]*"' "$session_file" | sed 's/"started_at": "//' | sed 's/"$//')
-
+			local session_id=$(basename "$session_file" .json)
+			local pid=$(grep -o '"pid": "[0-9]*"' "$session_file" | grep -o '[0-9]*')
+			local instance_id=$(grep -o '"instance_id": "[^"]*"' "$session_file" | sed 's/"instance_id": "//' | sed 's/"$//')
+			local cluster_name=$(grep -o '"cluster_name": "[^"]*"' "$session_file" | sed 's/"cluster_name": "//' | sed 's/"$//')
+			local started_at=$(grep -o '"started_at": "[^"]*"' "$session_file" | sed 's/"started_at": "//' | sed 's/"$//')
+			local uds_mode=$(grep -o '"uds_mode": "[^"]*"' "$session_file" | sed 's/"uds_mode": "//' | sed 's/"$//')
+			
 			# Check if process is still running
 			if kill -0 "$pid" 2>/dev/null; then
 				# Check if port is actually listening
@@ -881,14 +1178,22 @@ cmd_status() {
 				else
 					port_status="not listening"
 				fi
-
+				
 				echo "  Session: $session_id"
 				echo "    PID: $pid (running)"
 				echo "    Port 8443: $port_status"
 				echo "    Instance: $instance_id"
 				echo "    Cluster: $cluster_name"
 				echo "    Started: $started_at"
-
+				echo "    UDS Mode: $uds_mode"
+				
+				if [ "$uds_mode" = "true" ]; then
+					# Check Istio ports
+					echo "    Istio Ports:"
+					nc -z localhost 443 2>/dev/null && echo "      443 (tenant HTTPS): listening" || echo "      443 (tenant HTTPS): not listening"
+					nc -z localhost 9443 2>/dev/null && echo "      9443 (admin HTTPS): listening" || echo "      9443 (admin HTTPS): not listening"
+				fi
+				
 				if [ "$port_status" = "not listening" ]; then
 					echo "    ⚠ Warning: Process running but port not accessible"
 				fi
@@ -899,11 +1204,12 @@ cmd_status() {
 				echo "    Instance: $instance_id"
 				echo "    Cluster: $cluster_name"
 				echo "    Started: $started_at"
-
+				
 				# Check if temp dir exists for log access
+				local temp_dir=$(grep -o '"temp_dir": "[^"]*"' "$session_file" | sed 's/"temp_dir": "//' | sed 's/"$//')
 				if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
 					echo "    Log: $temp_dir/session.log"
-					echo "    ⚠ Session dead but logs preserved. Clean up with: udsm stop -s $session_id"
+					echo "    ⚠ Session dead but logs preserved. Clean up with: uds-ssm stop -S $session_id"
 				else
 					echo "    ⚠ Session dead, cleaning up"
 					cleanup_session "$session_file"
@@ -912,9 +1218,17 @@ cmd_status() {
 			fi
 		fi
 	done
-
+	
 	if [ "$found" = "false" ]; then
 		echo "  No active sessions found."
+	fi
+	
+	# Show hostctl status if any UDS profiles exist
+	if command -v hostctl &>/dev/null; then
+		echo ""
+		echo "Hostctl UDS profiles:"
+		local HOSTCTL_CMD=$(get_hostctl_cmd 2>/dev/null || echo "hostctl")
+		$HOSTCTL_CMD status 2>/dev/null | grep -E "uds-|Profile" || echo "  No UDS profiles found"
 	fi
 }
 
@@ -925,39 +1239,39 @@ main() {
 		show_usage
 		exit 0
 	fi
-
+	
 	local command="$1"
 	shift
-
+	
 	case "$command" in
-	start)
-		cmd_start "$@"
-		;;
-	ssh)
-		cmd_ssh "$@"
-		;;
-	stop)
-		cmd_stop "$@"
-		;;
-	status)
-		cmd_status "$@"
-		;;
-	env)
-		cmd_env "$@"
-		;;
-	logs)
-		cmd_logs "$@"
-		;;
-	help)
-		print_logo
-		show_usage
-		;;
-	*)
-		echo "Error: Unknown command: $command"
-		echo
-		show_usage
-		exit 1
-		;;
+		start)
+			cmd_start "$@"
+			;;
+		ssh)
+			cmd_ssh "$@"
+			;;
+		stop)
+			cmd_stop "$@"
+			;;
+		status)
+			cmd_status "$@"
+			;;
+		env)
+			cmd_env "$@"
+			;;
+		logs)
+			cmd_logs "$@"
+			;;
+		help)
+			print_logo
+			show_usage
+			;;
+		*)
+			echo "Error: Unknown command: $command"
+			echo
+			show_usage
+			exit 1
+			;;
 	esac
 }
 
